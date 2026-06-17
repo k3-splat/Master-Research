@@ -1,0 +1,30 @@
+import mne
+import numpy as np
+from mne_bids import BIDSPath
+from nilearn.plotting import plot_markers
+import matplotlib as plt
+
+if __name__=="__main__":
+    datalst = []
+
+    for i in range(9):
+        file_path = BIDSPath(root="/home/keitaro-sunagawa/Master-Research/ds005574/derivatives/ecogprep",
+                            subject=f"0{i + 1}",
+                            task="podcast",
+                            datatype="ieeg",
+                            description="highgamma",
+                            suffix="ieeg",
+                            extension="fif")
+        raw = mne.io.read_raw_fif(file_path, verbose=False)
+        print(raw.info)
+
+        ch2loc = {ch['ch_name']: ch['loc'][:3] for ch in raw.info['chs']}
+        coords = np.vstack([ch2loc[ch] for ch in raw.info['ch_names']])
+        coords *= 1000  # nilearn likes to plot in meters, not mm
+        print("Coordinate matrix shape: ", coords.shape)
+
+        values = np.ones(len(coords))
+        fig = plot_markers(values, coords,
+                    node_size=30, display_mode='lzr', alpha=1,
+                    node_cmap='Grays', colorbar=False, node_vmin=0, node_vmax=1,
+                    output_file=f'plt_brain_sub0{i + 1}.png')

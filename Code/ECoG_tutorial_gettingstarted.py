@@ -5,7 +5,7 @@ from nilearn.plotting import plot_markers
 import matplotlib as plt
 
 file_path = BIDSPath(root="/home/keitaro-sunagawa/Master-Research/ds005574/derivatives/ecogprep",
-                     subject="02",
+                     subject="03",
                      task="podcast",
                      datatype="ieeg",
                      description="highgamma",
@@ -14,8 +14,9 @@ file_path = BIDSPath(root="/home/keitaro-sunagawa/Master-Research/ds005574/deriv
 # print(f"File path within the dataset: {file_path}")
 
 raw = mne.io.read_raw_fif(file_path, verbose=False)
-fig = raw.plot_sensors()
-fig.savefig('./tutorial.png')
+metadata = raw.info
+print(metadata)
+# fig.savefig('./tutorial.png')
 
 ch2loc = {ch['ch_name']: ch['loc'][:3] for ch in raw.info['chs']}
 coords = np.vstack([ch2loc[ch] for ch in raw.info['ch_names']])
