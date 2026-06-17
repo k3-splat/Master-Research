@@ -27,4 +27,4 @@ if __name__=="__main__":
         fig = plot_markers(values, coords,
                     node_size=30, display_mode='lzr', alpha=1,
                     node_cmap='Grays', colorbar=False, node_vmin=0, node_vmax=1,
-                    output_file=f'plt_brain_sub0{i + 1}.png')
+                    output_file=f'ECoG_plot/plt_brain_sub0{i + 1}.png')
