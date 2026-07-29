@@ -66,7 +66,7 @@ output=ptnTrain;
 [~,num_frame]=size(signal_train{1});
 binary=zeros(nAfferents,num_frame);
 for i=1:1:nAfferents
-    temp=int16(output{i}*1000);
+    temp=int32(output{i}*1000);
     [~,num]=size(temp);
     if num>0
        binary(i,temp)=1;
