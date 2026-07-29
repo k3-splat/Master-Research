@@ -2,11 +2,11 @@
 clear all; clc; dbstop if error;
 
 % 1. BAEツール群へのパスを追加（ご自身の環境に合わせて絶対パスまたは相対パスで指定）
-addpath('C:\Users\gunda\Master-Research\Code\Encoder\tools'); 
+addpath('/home/keitaro-sunagawa/Master-Research/Code/Encoder/tools'); 
 % addpath('G:\Resarch Work\Threshold code and temporal masking'); 
 
 % 2. エンコードしたい特定の音声ファイルのパスを直接指定
-target_file_path = 'C:\Users\gunda\Master-Research\ds005574\se_saa08.wav'; 
+target_file_path = '/home/keitaro-sunagawa/Master-Research/ds005574/stimuli/podcast.wav'; 
 
 disp(['Processing file: ', target_file_path]);
 
