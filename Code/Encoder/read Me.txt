@@ -1,0 +1,1 @@
+1. Use this code to encode TIMIT speech datasets into spike patterns. Run Extract_TIMIT.m file to do the encoding.
