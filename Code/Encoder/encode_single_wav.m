@@ -1,6 +1,6 @@
 function [output,binary]=encode_single_wav(input_wav)
 
-addpath('\tools');
+%addpath('\tools');
 
 wavelet_window=4;
 %iteration=5;
@@ -8,7 +8,8 @@ N_train=1;
 
 %window_vector=[240,320,400,480,560,640,720,800,880,960,1040,1120];  %no 480
 %window_vector=[800];
-window_length=160;
+%window_length=160;
+window_length = 480;
 
 
 process_train=cell(N_train,1);
