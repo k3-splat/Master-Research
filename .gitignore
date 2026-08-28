@@ -1,2 +1,4 @@
 /ds005574
 /Code/precoss-beta
+LaTeX/*
+!LaTeX/*.pdf
