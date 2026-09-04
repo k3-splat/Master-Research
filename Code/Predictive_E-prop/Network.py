@@ -138,12 +138,17 @@ class PredictiveEPropRSNN(nn.Module):
             q = self.kappa_r * q + (1.0 / (self.tau_r * self.tau_d)) * z
             
             if not free_running:
-                L_t = torch.matmul(dt, self.B_align.t())
+                # 1. スケーリング係数 1 / (tau_r * tau_d) を追加 (Eq. 5 に準拠)
+                L_t = torch.matmul(dt, self.B_align.t()) / (self.tau_r * self.tau_d)
+                
                 psi_exp = psi.unsqueeze(2)           
                 z_pre_exp = z_prev_bar.unsqueeze(1)  
                 
-                trace_a = self.rho * trace_a + psi_exp * z_pre_exp
-                e_trace = (psi_exp * z_pre_exp) - (beta_exp * trace_a)
+                # 2. 減衰項 (self.rho - beta_exp * psi_exp) を正しく適用 (Eq. 9 に準拠)
+                trace_a = (self.rho - beta_exp * psi_exp) * trace_a + psi_exp * z_pre_exp
+                
+                # 3. psi_exp を全体に掛けるように修正 (Eq. 10 に準拠)
+                e_trace = psi_exp * (z_pre_exp - beta_exp * trace_a)
                 
                 L_t_exp = L_t.unsqueeze(2)
                 grad_W_rec += torch.sum(L_t_exp * e_trace, dim=0) 
