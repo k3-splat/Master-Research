@@ -103,7 +103,9 @@ class EPropOptimizer:
         self.grad_w_rec = np.zeros((n_neurons, n_neurons))
         self.grad_w_out = np.zeros((n_outputs, n_neurons))
         
+        # 恒常性正則化のための蓄積バッファ
         self.spike_buffer = np.zeros(n_neurons)
+        self.e_trace_sum = np.zeros((n_neurons, n_neurons))
         self.step_counter = 0
 
     def reset_traces(self):
@@ -112,6 +114,7 @@ class EPropOptimizer:
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
         self.spike_buffer.fill(0)
+        self.e_trace_sum.fill(0)
         self.step_counter = 0
 
     def update_traces_and_gradients(self, neurons, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
@@ -138,16 +141,18 @@ class EPropOptimizer:
         # 3. 恒常性正則化の勾配蓄積とオンラインアップデートの判定
         all_spikes = np.concatenate([g.z for g in neurons])
         self.spike_buffer += all_spikes
+        self.e_trace_sum += self.e_trace
         self.step_counter += 1
         
         if self.step_counter >= self.t_delay:
             f_bar = self.spike_buffer / self.t_delay
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
             
-            # 正則化項の勾配を加算
-            self.grad_w_rec += reg_signal[:, None] * self.e_trace
+            # 正則化項の勾配を蓄積した適格度トレースを用いて加算
+            self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
             
             self.spike_buffer.fill(0)
+            self.e_trace_sum.fill(0)
             self.step_counter = 0
             return True  # アップデート実行フラグを返す
         return False
@@ -272,7 +277,7 @@ if __name__ == "__main__":
     
     net = PredictiveEPropNet(n_inputs=1, n_lif=100, n_alif=200, n_outputs=1)
     
-    epochs = 10
+    epochs = 50
     out_train, out_error, out_free = None, None, None
     
     for epoch in range(epochs):
