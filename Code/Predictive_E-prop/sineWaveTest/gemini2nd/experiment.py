@@ -24,35 +24,35 @@ class BaseNeuronGroup:
         self.z = np.zeros(self.n)
         self.z_bar = np.zeros(self.n)
         self.z_bar_bar = np.zeros(self.n)
+        # 論文 Eq 2 に準拠した初期化
         self.q = np.zeros(self.n) + self.c_rd
         self.psi = np.zeros(self.n)
         self.b = np.full(self.n, self.v_th)
-        self.ref_counts = np.zeros(self.n)  # 不応期の残り時間カウンター
+        self.ref_counts = np.zeros(self.n)
 
     def _update_spikes_and_filters(self, v_next_raw, b_next):
-        # テンソル微分の近似 (Tent function) は repolarization 前の電位に基づく
+        # テンソル微分の近似
         self.psi = (self.gamma_d / self.v_th) * np.maximum(0, 1.0 - np.abs((v_next_raw - b_next) / self.v_th))
         
-        # スパイク判定 (不応期のニューロンは発火させない)
+        # スパイク判定 (不応期考慮)
         self.z = np.where((v_next_raw > b_next) & (self.ref_counts <= 0), 1.0, 0.0)
         
-        # Repolarization (発火したニューロンの電位を閾値分下げる)
+        # Repolarization
         v_next = v_next_raw - self.z * b_next
         
-        # 不応期の適用 (過去に発火して不応期中のものは電位を固定)
+        # 不応期の適用
         is_refractory = self.ref_counts > 0
         v_next[is_refractory] = self.v[is_refractory]
         
-        # 不応期カウンターの更新
         self.ref_counts = np.maximum(0, self.ref_counts - self.dt)
         self.ref_counts[self.z > 0] = self.t_ref
         
-        # 2重指数関数フィルター (Eq 2に準拠)
+        # 2重指数関数フィルター
         q_prev = self.q.copy()
         self.q = self.decay_r * self.q + self.c_rd * self.z
         self.z_bar_bar = self.decay_d * self.z_bar_bar + q_prev
         
-        # 単一低周波フィルター (z_bar)
+        # 単一低周波フィルター
         self.z_bar = self.alpha * self.z_bar + self.z_bar_bar
 
         self.v = v_next
@@ -64,7 +64,6 @@ class LIFGroup(BaseNeuronGroup):
         self.beta = 0.0
 
     def step(self, input_current):
-        # 膜電位の更新
         v_next_raw = self.alpha * self.v + input_current
         b_next = np.full(self.n, self.v_th)
         self._update_spikes_and_filters(v_next_raw, b_next)
@@ -81,13 +80,9 @@ class ALIFGroup(BaseNeuronGroup):
         self.a = np.zeros(self.n)
 
     def step(self, input_current):
-        # 適応変数の更新
         self.a = self.rho * self.a + self.z
-        
-        # 膜電位と閾値の更新
         v_next_raw = self.alpha * self.v + input_current
         b_next = self.v_th + self.beta * self.a
-        
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 # ==========================================
@@ -102,15 +97,12 @@ class EPropOptimizer:
         self.t_delay = t_delay
         self.f_star = f_star
         
-        # 適格度トレース用変数
         self.e_trace = np.zeros((n_neurons, n_neurons))
         self.eps_b = np.zeros((n_neurons, n_neurons))
         
-        # 勾配蓄積用
         self.grad_w_rec = np.zeros((n_neurons, n_neurons))
         self.grad_w_out = np.zeros((n_outputs, n_neurons))
         
-        # 発火率計算用バッファ
         self.spike_buffer = np.zeros(n_neurons)
         self.step_counter = 0
 
@@ -130,7 +122,7 @@ class EPropOptimizer:
             beta = neuron_group.beta
             rho = getattr(neuron_group, 'rho', 0.0)
             
-            psi_curr = neuron_group.psi[:, None]  # (n_g, 1)
+            psi_curr = neuron_group.psi[:, None]
             psi_prev_g = psi_prev[offset:offset+n_g, None]
             
             if beta > 0:
@@ -139,28 +131,35 @@ class EPropOptimizer:
                 
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
         
-        # 2. タスク勾配の蓄積 (Gradient descentのために蓄積)
+        # 2. タスク勾配の蓄積
         self.grad_w_rec += L_t[:, None] * self.e_trace
         self.grad_w_out += np.outer(error_t, z_bar_prev)
         
-        # 3. 恒常性正則化の勾配蓄積 (t_delay ごと)
+        # 3. 恒常性正則化の勾配蓄積とオンラインアップデートの判定
         all_spikes = np.concatenate([g.z for g in neurons])
         self.spike_buffer += all_spikes
         self.step_counter += 1
         
         if self.step_counter >= self.t_delay:
             f_bar = self.spike_buffer / self.t_delay
-            # 正則化項の勾配も加算してトータルの勾配とする
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
+            
+            # 正則化項の勾配を加算
             self.grad_w_rec += reg_signal[:, None] * self.e_trace
             
             self.spike_buffer.fill(0)
             self.step_counter = 0
+            return True  # アップデート実行フラグを返す
+        return False
 
     def apply_weight_update(self, w_rec, w_out):
-        # 勾配降下法 (+= から -= に修正) と重み減衰の適用
-        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
-        w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
+        # 勾配降下法による重みの更新
+        # 勾配爆発を防ぐための安全なクリッピング（生物学的な重みの制約を模倣）
+        grad_rec_clipped = np.clip(self.grad_w_rec, -10.0, 10.0)
+        grad_out_clipped = np.clip(self.grad_w_out, -10.0, 10.0)
+        
+        w_rec -= self.eta * grad_rec_clipped + self.eta * (2 * self.lambda_w) * w_rec
+        w_out -= self.eta * grad_out_clipped + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
@@ -177,19 +176,17 @@ class PredictiveEPropNet:
         self.n_neurons = n_lif + n_alif
         self.n_outputs = n_outputs
         
-        # ニューロングループの初期化
         self.lif = LIFGroup(n_lif)
         self.alif = ALIFGroup(n_alif)
         self.neurons = [self.lif, self.alif]
         
-        # 重みの初期化
+        # 論文メソッドセクションに沿った重みの初期化
         self.w_in = np.random.randn(self.n_neurons, n_inputs) / np.sqrt(g)
         self.w_fb = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(g)
         self.w_rec = np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
         self.B = np.random.randn(self.n_neurons, n_outputs)
         
-        # バイアスとノイズパラメータ
         self.I_bias = 0.02
         self.tau_s = 250.0
         self.sigma_s = 1.0
@@ -232,6 +229,7 @@ class PredictiveEPropNet:
             i_rec = self.w_rec @ all_z_bar_bar
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
+            
             total_current = xi * i_in + i_rec + i_fb + self.I_bias + s_t
             
             self.lif.step(total_current[:self.n_lif])
@@ -242,16 +240,17 @@ class PredictiveEPropNet:
                 L_t = (self.B @ d_t) * c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
-                self.optimizer.update_traces_and_gradients(
+                should_update = self.optimizer.update_traces_and_gradients(
                     self.neurons, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
+                
+                # t_delay (10ms) ごとにオンラインで重みを更新する
+                if should_update:
+                    self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
                 
                 z_bar_prev_prev = z_bar_prev.copy()
                 z_bar_prev = all_z_bar.copy()
                 psi_prev = all_psi.copy()
-
-        if phase == "training":
-            self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
             
         return outputs
 
@@ -273,7 +272,7 @@ if __name__ == "__main__":
     
     net = PredictiveEPropNet(n_inputs=1, n_lif=100, n_alif=200, n_outputs=1)
     
-    epochs = 50
+    epochs = 10
     out_train, out_error, out_free = None, None, None
     
     for epoch in range(epochs):
@@ -292,7 +291,7 @@ if __name__ == "__main__":
         print(f"  Free-running Loss: {loss_free:.5f}")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"predictive_eprop_result_{timestamp}.png"
+    filename = f"output/predictive_eprop_result_{timestamp}.png"
     
     fig, axes = plt.subplots(3, 1, figsize=(10, 8))
     
