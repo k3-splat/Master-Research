@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import datetime
-import os
 
 # ==========================================
 # 1. データ生成モジュール
@@ -40,7 +39,7 @@ class SpikingNeuronLayer(nn.Module):
                  sparsity=0.99,
                  tau_s=250.0,
                  sigma_s=1.0,
-                 beta_alif=0.1): # 安定動作のため調整
+                 beta_alif=1.0): 
         
         super(SpikingNeuronLayer, self).__init__()
         
@@ -148,7 +147,6 @@ class EPropOptimizer:
         self.t_delay = t_delay
         self.n_total = network.n_total
         
-        # Broadcast Alignment 行列の初期化
         self.B = torch.randn(self.n_total, 1) / torch.sqrt(torch.tensor(float(self.n_total)))
         self.reset_states()
 
@@ -162,6 +160,7 @@ class EPropOptimizer:
         self.dW_out = torch.zeros(1, self.n_total)
         
         self.spike_count = torch.zeros(self.n_total)
+        self.current_f_error = torch.zeros(self.n_total)
         self.step_counter = 0
 
     def step(self, x_t, y_t, v_t, b_t, z_t, z_bar_t, is_training=True):
@@ -179,9 +178,11 @@ class EPropOptimizer:
             z_bar_prev1_matrix = self.z_bar_prev1.unsqueeze(0).repeat(self.n_total, 1)
             e_trace = psi_t.unsqueeze(1) * (z_bar_prev1_matrix - beta_matrix * self.eps_b)
             
-            L_t = self.B * d_t * self.network.filter_c
+            L_t_pred = self.B * d_t * self.network.filter_c
+            L_t_reg = (self.lambda_reg / self.t_delay) * self.current_f_error.unsqueeze(1)
             
-            # 勾配の蓄積
+            L_t = L_t_pred + L_t_reg
+            
             self.dW_rec += L_t * e_trace
             self.dW_out += d_t * z_bar_t.unsqueeze(0)
             
@@ -189,6 +190,9 @@ class EPropOptimizer:
             self.step_counter += 1
             
             if self.step_counter >= self.t_delay:
+                f_bar = self.spike_count / self.t_delay
+                self.current_f_error = f_bar - self.f_target
+                
                 self.apply_updates_and_regularization()
                 self.spike_count.zero_()
                 self.step_counter = 0
@@ -199,23 +203,15 @@ class EPropOptimizer:
 
     def apply_updates_and_regularization(self):
         with torch.no_grad():
-            # 勾配クリッピング（発散防止）
             torch.clamp_(self.dW_rec, -1.0, 1.0)
             torch.clamp_(self.dW_out, -1.0, 1.0)
             
-            # 最急降下法: 勾配の「減算」による重み更新
             self.network.W_rec -= self.lr * self.dW_rec
             self.network.W_out -= self.lr * self.dW_out
             
-            # 重み減衰
-            self.network.W_rec -= self.lambda_w * self.network.W_rec
-            self.network.W_out -= self.lambda_w * self.network.W_out
-            
-            # 発火率の正則化
-            f_bar = self.spike_count / self.t_delay
-            f_error = f_bar - self.f_target
-            reg_penalty = self.lambda_reg * f_error.unsqueeze(1).repeat(1, self.n_total)
-            self.network.W_rec -= self.lr * reg_penalty
+            decay_factor = self.lr * self.lambda_w * self.t_delay
+            self.network.W_rec -= decay_factor * self.network.W_rec
+            self.network.W_out -= decay_factor * self.network.W_out
             
             self.dW_rec.zero_()
             self.dW_out.zero_()
@@ -236,14 +232,17 @@ class ExperimentController:
         self.total_time = self.t_train + self.t_error + self.t_free
         self.target_signal = self.generator.generate(self.total_time)
 
-    def run_epoch(self):
+    def run_epoch(self, epoch_num):
         self.network.reset_states()
-        self.optimizer.reset_states()
+        
+        self.optimizer.spike_count.zero_()
+        self.optimizer.current_f_error.zero_()
+        self.optimizer.step_counter = 0
         
         outputs = []
         spikes = []
         
-        print("Starting Epoch...")
+        print(f"Starting Epoch {epoch_num}...")
         
         for t in range(int(self.total_time)):
             x_t = self.target_signal[t]
@@ -278,12 +277,9 @@ class ExperimentController:
             if t % 10 == 0:
                 spikes.append((t, z_t.nonzero().squeeze(1).numpy()))
                 
-            if (t + 1) % 5000 == 0:
-                print(f"  Processed {t + 1} / {self.total_time} ms")
-                
         return torch.stack(outputs).squeeze(), self.target_signal.squeeze(), spikes
 
-    def plot_results(self, outputs, targets, spikes):
+    def plot_results(self, outputs, targets, spikes, epoch_num):
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
         
         t_axis = torch.arange(self.total_time).numpy()
@@ -294,9 +290,8 @@ class ExperimentController:
         ax1.axvspan(self.t_train, self.t_train + self.t_error, color='cyan', alpha=0.1, label='Error-driven')
         ax1.axvspan(self.t_train + self.t_error, self.total_time, color='purple', alpha=0.1, label='Free-running')
         
-        # 描画範囲を固定して視認性を確保
-        ax1.set_ylim(-1.5, 1.5)
-        ax1.set_title("Network Output vs Target Signal")
+        ax1.set_ylim(-1.0, 1.0)
+        ax1.set_title(f"Network Output vs Target Signal (Epoch {epoch_num})")
         ax1.set_ylabel("Signal")
         ax1.legend(loc='upper right')
         
@@ -309,16 +304,16 @@ class ExperimentController:
         ax2.axvspan(self.t_train + self.t_error, self.total_time, color='purple', alpha=0.1)
         
         ax2.axhline(100, color='red', linestyle='--', linewidth=1, label='LIF / ALIF boundary')
-        ax2.set_title("Spike Raster Plot (Subsampled 1/10)")
+        ax2.set_title(f"Spike Raster Plot (Epoch {epoch_num} - Subsampled 1/10)")
         ax2.set_xlabel("Time (ms)")
         ax2.set_ylabel("Neuron Index")
         
         plt.tight_layout()
         
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"predictive_eprop_epoch_fixed_{current_time}.png"
+        filename = f"predictive_eprop_epoch{epoch_num}_{current_time}.png"
         plt.savefig(filename)
-        print(f"\nPlot saved as {filename}")
+        print(f"Plot saved as {filename}")
         plt.close()
 
 
@@ -332,5 +327,11 @@ if __name__ == "__main__":
     
     controller = ExperimentController(generator, network, optimizer)
     
-    outputs, targets, spikes = controller.run_epoch()
-    controller.plot_results(outputs, targets, spikes)
+    # 50エポック分の学習を実行
+    num_epochs = 50
+    for epoch in range(num_epochs):
+        outputs, targets, spikes = controller.run_epoch(epoch)
+        
+        # 最終エポックのみプロットを出力
+        if epoch == num_epochs - 1:
+            controller.plot_results(outputs, targets, spikes, epoch)
