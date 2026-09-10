@@ -40,7 +40,7 @@ class SpikingNeuronLayer(nn.Module):
                  sparsity=0.99,
                  tau_s=250.0,
                  sigma_s=1.0,
-                 beta_alif=1.0):
+                 beta_alif=0.1): # 安定動作のため調整
         
         super(SpikingNeuronLayer, self).__init__()
         
@@ -148,7 +148,8 @@ class EPropOptimizer:
         self.t_delay = t_delay
         self.n_total = network.n_total
         
-        self.B = torch.randn(self.n_total, 1)
+        # Broadcast Alignment 行列の初期化
+        self.B = torch.randn(self.n_total, 1) / torch.sqrt(torch.tensor(float(self.n_total)))
         self.reset_states()
 
     def reset_states(self):
@@ -180,8 +181,9 @@ class EPropOptimizer:
             
             L_t = self.B * d_t * self.network.filter_c
             
-            self.dW_rec += self.lr * L_t * e_trace
-            self.dW_out += self.lr * d_t * z_bar_t.unsqueeze(0)
+            # 勾配の蓄積
+            self.dW_rec += L_t * e_trace
+            self.dW_out += d_t * z_bar_t.unsqueeze(0)
             
             self.spike_count += z_t
             self.step_counter += 1
@@ -197,12 +199,19 @@ class EPropOptimizer:
 
     def apply_updates_and_regularization(self):
         with torch.no_grad():
-            self.network.W_rec += self.dW_rec
-            self.network.W_out += self.dW_out
+            # 勾配クリッピング（発散防止）
+            torch.clamp_(self.dW_rec, -1.0, 1.0)
+            torch.clamp_(self.dW_out, -1.0, 1.0)
             
+            # 最急降下法: 勾配の「減算」による重み更新
+            self.network.W_rec -= self.lr * self.dW_rec
+            self.network.W_out -= self.lr * self.dW_out
+            
+            # 重み減衰
             self.network.W_rec -= self.lambda_w * self.network.W_rec
             self.network.W_out -= self.lambda_w * self.network.W_out
             
+            # 発火率の正則化
             f_bar = self.spike_count / self.t_delay
             f_error = f_bar - self.f_target
             reg_penalty = self.lambda_reg * f_error.unsqueeze(1).repeat(1, self.n_total)
@@ -221,13 +230,10 @@ class ExperimentController:
         self.network = network
         self.optimizer = optimizer
         
-        # 各フェーズの時間設定 (ms)
         self.t_train = 10000
         self.t_error = 5000
         self.t_free = 5000
         self.total_time = self.t_train + self.t_error + self.t_free
-        
-        # ターゲット信号の事前生成
         self.target_signal = self.generator.generate(self.total_time)
 
     def run_epoch(self):
@@ -242,28 +248,21 @@ class ExperimentController:
         for t in range(int(self.total_time)):
             x_t = self.target_signal[t]
             
-            # フェーズ制御
             if t < self.t_train:
-                # Training phase: 誤差入力あり, 重み更新あり
                 xi = 1.0
                 is_training = True
             elif t < self.t_train + self.t_error:
-                # Error-driven phase: 誤差入力あり, 重み更新なし
                 xi = 1.0
                 is_training = False
             else:
-                # Free-running phase: 誤差入力なし, 重み更新なし
                 xi = 0.0
                 is_training = False
             
-            # 予測誤差の計算（t=0では出力は0とみなす）
             y_t_prev = outputs[-1] if t > 0 else torch.tensor([0.0])
             d_t = y_t_prev - x_t if xi == 1.0 else torch.zeros(1)
             
-            # 順伝播
             y_t, z_t, b_t = self.network.forward_step(d_t, xi=xi)
             
-            # 学習ステップ
             self.optimizer.step(
                 x_t=x_t, 
                 y_t=y_t, 
@@ -276,7 +275,6 @@ class ExperimentController:
             
             outputs.append(y_t.clone())
             
-            # メモリ節約のため、スパイクデータは間引いて保存（全保存すると重くなるため）
             if t % 10 == 0:
                 spikes.append((t, z_t.nonzero().squeeze(1).numpy()))
                 
@@ -288,21 +286,20 @@ class ExperimentController:
     def plot_results(self, outputs, targets, spikes):
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
         
-        # ネットワーク出力 vs ターゲット
         t_axis = torch.arange(self.total_time).numpy()
         ax1.plot(t_axis, targets.numpy(), label='Target', color='black', alpha=0.6)
         ax1.plot(t_axis, outputs.numpy(), label='Output', color='red', alpha=0.8)
         
-        # フェーズの背景色設定
         ax1.axvspan(0, self.t_train, color='green', alpha=0.1, label='Training')
         ax1.axvspan(self.t_train, self.t_train + self.t_error, color='cyan', alpha=0.1, label='Error-driven')
         ax1.axvspan(self.t_train + self.t_error, self.total_time, color='purple', alpha=0.1, label='Free-running')
         
+        # 描画範囲を固定して視認性を確保
+        ax1.set_ylim(-1.5, 1.5)
         ax1.set_title("Network Output vs Target Signal")
         ax1.set_ylabel("Signal")
         ax1.legend(loc='upper right')
         
-        # スパイクラスタプロット
         for t, active_neurons in spikes:
             if len(active_neurons) > 0:
                 ax2.scatter([t] * len(active_neurons), active_neurons, s=1, c='black')
@@ -319,7 +316,7 @@ class ExperimentController:
         plt.tight_layout()
         
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"predictive_eprop_epoch_{current_time}.png"
+        filename = f"predictive_eprop_epoch_fixed_{current_time}.png"
         plt.savefig(filename)
         print(f"\nPlot saved as {filename}")
         plt.close()
@@ -335,8 +332,5 @@ if __name__ == "__main__":
     
     controller = ExperimentController(generator, network, optimizer)
     
-    # 1エポック分のシミュレーションを実行
     outputs, targets, spikes = controller.run_epoch()
-    
-    # 結果のプロットと保存
     controller.plot_results(outputs, targets, spikes)
