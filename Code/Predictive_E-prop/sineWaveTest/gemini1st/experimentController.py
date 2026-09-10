@@ -160,7 +160,6 @@ class EPropOptimizer:
         self.dW_out = torch.zeros(1, self.n_total)
         
         self.spike_count = torch.zeros(self.n_total)
-        self.current_f_error = torch.zeros(self.n_total)
         self.step_counter = 0
 
     def step(self, x_t, y_t, v_t, b_t, z_t, z_bar_t, is_training=True):
@@ -178,10 +177,8 @@ class EPropOptimizer:
             z_bar_prev1_matrix = self.z_bar_prev1.unsqueeze(0).repeat(self.n_total, 1)
             e_trace = psi_t.unsqueeze(1) * (z_bar_prev1_matrix - beta_matrix * self.eps_b)
             
-            L_t_pred = self.B * d_t * self.network.filter_c
-            L_t_reg = (self.lambda_reg / self.t_delay) * self.current_f_error.unsqueeze(1)
-            
-            L_t = L_t_pred + L_t_reg
+            # 純粋な予測誤差シグナルのみを使用
+            L_t = self.B * d_t * self.network.filter_c
             
             self.dW_rec += L_t * e_trace
             self.dW_out += d_t * z_bar_t.unsqueeze(0)
@@ -190,9 +187,6 @@ class EPropOptimizer:
             self.step_counter += 1
             
             if self.step_counter >= self.t_delay:
-                f_bar = self.spike_count / self.t_delay
-                self.current_f_error = f_bar - self.f_target
-                
                 self.apply_updates_and_regularization()
                 self.spike_count.zero_()
                 self.step_counter = 0
@@ -203,15 +197,19 @@ class EPropOptimizer:
 
     def apply_updates_and_regularization(self):
         with torch.no_grad():
-            torch.clamp_(self.dW_rec, -1.0, 1.0)
-            torch.clamp_(self.dW_out, -1.0, 1.0)
-            
+            # 1. 予測誤差の最小化 (e-prop則)
             self.network.W_rec -= self.lr * self.dW_rec
             self.network.W_out -= self.lr * self.dW_out
             
-            decay_factor = self.lr * self.lambda_w * self.t_delay
-            self.network.W_rec -= decay_factor * self.network.W_rec
-            self.network.W_out -= decay_factor * self.network.W_out
+            # 2. 恒常性可塑性 (e-propと並行して適用)
+            f_bar = self.spike_count / self.t_delay
+            f_error = f_bar - self.f_target
+            reg_penalty = self.lambda_reg * f_error.unsqueeze(1).repeat(1, self.n_total)
+            self.network.W_rec -= self.lr * reg_penalty
+            
+            # 3. 重み減衰
+            self.network.W_rec -= self.lr * self.lambda_w * self.network.W_rec
+            self.network.W_out -= self.lr * self.lambda_w * self.network.W_out
             
             self.dW_rec.zero_()
             self.dW_out.zero_()
@@ -236,7 +234,6 @@ class ExperimentController:
         self.network.reset_states()
         
         self.optimizer.spike_count.zero_()
-        self.optimizer.current_f_error.zero_()
         self.optimizer.step_counter = 0
         
         outputs = []
@@ -327,11 +324,9 @@ if __name__ == "__main__":
     
     controller = ExperimentController(generator, network, optimizer)
     
-    # 50エポック分の学習を実行
     num_epochs = 50
     for epoch in range(num_epochs):
         outputs, targets, spikes = controller.run_epoch(epoch)
         
-        # 最終エポックのみプロットを出力
         if epoch == num_epochs - 1:
             controller.plot_results(outputs, targets, spikes, epoch)
