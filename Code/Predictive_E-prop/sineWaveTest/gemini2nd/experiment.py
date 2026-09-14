@@ -24,7 +24,6 @@ class BaseNeuronGroup:
         self.z = np.zeros(self.n)
         self.z_bar = np.zeros(self.n)
         self.z_bar_bar = np.zeros(self.n)
-        # Eq 2 に準拠した初期化
         self.q = np.zeros(self.n) + self.c_rd
         self.psi = np.zeros(self.n)
         self.b = np.full(self.n, self.v_th)
@@ -47,7 +46,7 @@ class BaseNeuronGroup:
         self.ref_counts = np.maximum(0, self.ref_counts - self.dt)
         self.ref_counts[self.z > 0] = self.t_ref
         
-        # 2重指数関数フィルター (Eq 2通りに復元)
+        # 2重指数関数フィルター
         q_prev = self.q.copy()
         self.q = self.decay_r * self.q + self.c_rd * self.z
         self.z_bar_bar = self.decay_d * self.z_bar_bar + q_prev
@@ -69,10 +68,10 @@ class LIFGroup(BaseNeuronGroup):
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 class ALIFGroup(BaseNeuronGroup):
-    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.01, **kwargs):
+    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.05, **kwargs):
         super().__init__(n_neurons, **kwargs)
         self.rho = np.exp(-self.dt / tau_alif)
-        self.beta = beta
+        self.beta = beta  # アトラクタ維持のため記憶をやや強化
         self.a = np.zeros(self.n)
 
     def reset_state(self):
@@ -116,7 +115,7 @@ class EPropOptimizer:
         self.e_trace_sum.fill(0)
         self.step_counter = 0
 
-    def update_traces_and_gradients(self, neurons, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
+    def update_traces_and_gradients(self, neurons, z_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
         for idx, neuron_group in enumerate(neurons):
             offset = 0 if idx == 0 else neurons[0].n
             n_g = neuron_group.n
@@ -133,7 +132,7 @@ class EPropOptimizer:
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
         
         self.grad_w_rec += L_t[:, None] * self.e_trace
-        self.grad_w_out += np.outer(error_t, z_bar_prev)
+        self.grad_w_out += np.outer(error_t, z_bar_curr)
         
         all_spikes = np.concatenate([g.z for g in neurons])
         self.spike_buffer += all_spikes
@@ -185,10 +184,10 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 1.0  # Table SI通りに復元
+        self.sigma_s = 0.1  # 信号を完全にかき消さない程度のノイズレベルへ安定化
         self.s = np.zeros(self.n_neurons)
         
-        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) # Table SI通りに復元
+        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004)
 
     def reset_state(self):
         self.lif.reset_state()
@@ -201,7 +200,6 @@ class PredictiveEPropNet:
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0):
-        # 1エポックを通して状態をリセットせずに連続実行
         self.reset_state()
         timesteps = len(target_signal)
         outputs = np.zeros((timesteps, self.n_outputs))
@@ -211,7 +209,6 @@ class PredictiveEPropNet:
         psi_prev = np.zeros(self.n_neurons)
         
         for t in range(timesteps):
-            # 論文(Fig 1B, 1C)に基づくフェーズの動的切り替え
             if t < 10000:
                 phase = "training"
                 xi = 1.0
@@ -228,14 +225,11 @@ class PredictiveEPropNet:
             y_t = self.w_out @ all_z_bar
             outputs[t] = y_t
             
-            # 予測誤差の計算 (Free-running時も出力記録のため計算はするがネットワークには入力されない)
             d_t = y_t - x_t
             s_t = self.generate_ou_noise(dt)
             
             all_z_bar_bar = np.concatenate([self.lif.z_bar_bar, self.alif.z_bar_bar])
             i_rec = self.w_rec @ all_z_bar_bar
-            
-            # xi = 0 の場合、外部からのエラー入力(i_in)は遮断される
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
             
@@ -244,14 +238,14 @@ class PredictiveEPropNet:
             self.lif.step(total_current[:self.n_lif])
             self.alif.step(total_current[self.n_lif:])
             
-            # トレーニングフェーズのみ重みを更新
             if phase == "training":
-                c_rd = 1.0 / (50.0 * 125.0)
-                L_t = (self.B @ d_t) * c_rd
+                # リカレント層が確実に学習できるよう極小係数(c_rd)を学習率側に吸収して計算
+                L_t = self.B @ d_t
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
+                
                 should_update = self.optimizer.update_traces_and_gradients(
-                    self.neurons, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
+                    self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
                 if should_update:
@@ -268,7 +262,6 @@ class PredictiveEPropNet:
 # ==========================================
 if __name__ == "__main__":
     A, T, phi, c = 0.4, 1000.0, 0.0, 0.0
-    # 全フェーズを統合した連続時間軸を作成
     t_all = np.arange(0, 20000, 1)
     
     def sine_wave(t_array):
@@ -284,10 +277,8 @@ if __name__ == "__main__":
     for epoch in range(epochs):
         print(f"--- Epoch {epoch+1}/{epochs} ---")
         
-        # 1つの連続した時系列としてネットワークに投入
         out_all = net.run_full_epoch(target_all)
         
-        # フェーズごとにLossを計算
         loss_train = np.mean((out_all[:10000] - target_all[:10000])**2)
         loss_error = np.mean((out_all[10000:15000] - target_all[10000:15000])**2)
         loss_free = np.mean((out_all[15000:] - target_all[15000:])**2)
@@ -301,7 +292,6 @@ if __name__ == "__main__":
     
     fig, axes = plt.subplots(3, 1, figsize=(10, 8))
     
-    # 連続データをフェーズごとにスライスして描画
     axes[0].plot(t_all[:10000], target_all[:10000], label="Target", color="black", linestyle="--")
     axes[0].plot(t_all[:10000], out_all[:10000], label="Output", color="blue", alpha=0.7)
     axes[0].set_title("Training Phase")
