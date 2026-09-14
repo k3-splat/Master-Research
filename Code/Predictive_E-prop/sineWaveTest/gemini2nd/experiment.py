@@ -14,6 +14,7 @@ class BaseNeuronGroup:
         self.decay_d = np.exp(-dt / tau_d)
         self.v_th = v_th
         self.gamma_d = gamma_d
+        self.c_rd = 1.0 / (tau_r * tau_d)
         self.t_ref = t_ref
         
         self.reset_state()
@@ -23,7 +24,8 @@ class BaseNeuronGroup:
         self.z = np.zeros(self.n)
         self.z_bar = np.zeros(self.n)
         self.z_bar_bar = np.zeros(self.n)
-        self.q = np.zeros(self.n)
+        # Eq 2 に準拠した初期化: q の初期値は c_rd
+        self.q = np.zeros(self.n) + self.c_rd
         self.psi = np.zeros(self.n)
         self.b = np.full(self.n, self.v_th)
         self.ref_counts = np.zeros(self.n)
@@ -45,9 +47,9 @@ class BaseNeuronGroup:
         self.ref_counts = np.maximum(0, self.ref_counts - self.dt)
         self.ref_counts[self.z > 0] = self.t_ref
         
-        # 2重指数関数フィルター (スケール崩壊を防ぐため定数係数を削除)
+        # 2重指数関数フィルター (【重要】物理スケールを保つため c_rd を復元)
         q_prev = self.q.copy()
-        self.q = self.decay_r * self.q + self.z
+        self.q = self.decay_r * self.q + self.c_rd * self.z
         self.z_bar_bar = self.decay_d * self.z_bar_bar + q_prev
         
         # 単一低周波フィルター
@@ -67,7 +69,6 @@ class LIFGroup(BaseNeuronGroup):
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 class ALIFGroup(BaseNeuronGroup):
-    # アトラクタの維持能力を高めるため beta を 0.05 に設定
     def __init__(self, n_neurons, tau_alif=2000.0, beta=0.05, **kwargs):
         super().__init__(n_neurons, **kwargs)
         self.rho = np.exp(-self.dt / tau_alif)
@@ -184,10 +185,10 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 1.0 
+        self.sigma_s = 1.0  # Table SIの設定値[cite: 1]
         self.s = np.zeros(self.n_neurons)
         
-        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004)
+        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) # Table SIの設定値[cite: 1]
 
     def reset_state(self):
         self.lif.reset_state()
@@ -239,7 +240,7 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                # リカレント層の勾配消失を防ぐため定数係数を除去
+                # 【重要】勾配バランスを取るため、学習信号 L_t から c_rd を除外 (リカレント層の学習率を相対的に引き上げ)
                 L_t = self.B @ d_t
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
