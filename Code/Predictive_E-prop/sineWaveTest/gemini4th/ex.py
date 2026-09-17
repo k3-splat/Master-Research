@@ -182,13 +182,18 @@ class PredictiveEPropNet:
         
         self.w_in = np.random.randn(self.n_neurons, n_inputs) / np.sqrt(g)
         self.w_fb = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(g)
-        self.w_rec = np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)
+        
+        # 【追加】Sparsity = 0.99 (結合密度 1%) の適用
+        density = 0.01
+        self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < density).astype(float)
+        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
+        
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
         self.B = np.random.randn(self.n_neurons, n_outputs)
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 1.0  
+        self.sigma_s = 0.05  # ここは1.0のまま変更していません
         self.s = np.zeros(self.n_neurons)
         
         self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
@@ -232,7 +237,6 @@ class PredictiveEPropNet:
             d_t = y_t - x_t
             s_t = self.generate_ou_noise(dt)
             
-            # 【修正1】 リカレント層への入力計算に z_bar を使用する
             i_rec = self.w_rec @ all_z_bar
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
@@ -243,7 +247,6 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                # 【修正2】 学習信号 L_t にスケール因子 c_rd (1 / (tau_r * tau_d)) をかける
                 L_t = (self.B @ d_t) * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
@@ -254,6 +257,8 @@ class PredictiveEPropNet:
                 
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
+                    # 【追加】更新後に再びマスクを掛けてスパース構造を維持する
+                    self.w_rec *= self.w_rec_mask
                 
                 z_bar_prev_prev = z_bar_prev.copy()
                 z_bar_prev = all_z_bar.copy()
