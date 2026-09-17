@@ -152,11 +152,9 @@ class EPropOptimizer:
         return False
 
     def apply_weight_update(self, w_rec, w_out):
-        grad_rec_clipped = np.clip(self.grad_w_rec, -10.0, 10.0)
-        grad_out_clipped = np.clip(self.grad_w_out, -10.0, 10.0)
-        
-        w_rec -= self.eta * grad_rec_clipped + self.eta * (2 * self.lambda_w) * w_rec
-        w_out -= self.eta * grad_out_clipped + self.eta * (2 * self.lambda_w) * w_out
+        # クリップ処理を削除し、直接勾配と重み減衰を適用
+        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
+        w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
@@ -185,10 +183,10 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 1.0  # Table SIの設定値[cite: 1]
+        self.sigma_s = 1.0
         self.s = np.zeros(self.n_neurons)
         
-        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) # Table SIの設定値[cite: 1]
+        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004)
 
     def reset_state(self):
         self.lif.reset_state()
@@ -240,8 +238,7 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                # 【重要】勾配バランスを取るため、学習信号 L_t から c_rd を除外 (リカレント層の学習率を相対的に引き上げ)
-                L_t = self.B @ d_t
+                L_t = (self.B @ d_t) * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
