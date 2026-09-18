@@ -157,9 +157,6 @@ class EPropOptimizer:
         
         w_rec -= self.eta * grad_rec_clipped + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * grad_out_clipped + self.eta * (2 * self.lambda_w) * w_out
-
-        # w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
-        # w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
@@ -183,7 +180,7 @@ class PredictiveEPropNet:
         self.w_in = np.random.randn(self.n_neurons, n_inputs) / np.sqrt(g)
         self.w_fb = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(g)
         
-        # 【追加】Sparsity = 0.99 (結合密度 1%) の適用
+        # Sparsity = 0.99 (結合密度 1%) の適用
         density = 0.01
         self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < density).astype(float)
         self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
@@ -193,7 +190,7 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.05  # ここは1.0のまま変更していません
+        self.sigma_s = 0.05  
         self.s = np.zeros(self.n_neurons)
         
         self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
@@ -247,7 +244,8 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                L_t = (self.B @ d_t) * self.lif.c_rd
+                # 【修正】勾配スケールのバランスを取るため、ユーザーのオリジナル実装通り c_rd を除外
+                L_t = self.B @ d_t 
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
@@ -257,7 +255,7 @@ class PredictiveEPropNet:
                 
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
-                    # 【追加】更新後に再びマスクを掛けてスパース構造を維持する
+                    # 更新後に再びマスクを掛けてスパース構造を維持する
                     self.w_rec *= self.w_rec_mask
                 
                 z_bar_prev_prev = z_bar_prev.copy()
