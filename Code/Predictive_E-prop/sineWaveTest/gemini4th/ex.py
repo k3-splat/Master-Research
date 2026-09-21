@@ -171,16 +171,16 @@ class EPropOptimizer:
         return False
 
     def apply_weight_update(self, w_rec, w_out):
-        grad_rec_clipped = np.clip(self.grad_w_rec, -10.0, 10.0)
-        grad_out_clipped = np.clip(self.grad_w_out, -10.0, 10.0)
+        # grad_rec_clipped = np.clip(self.grad_w_rec, -10.0, 10.0)
+        # grad_out_clipped = np.clip(self.grad_w_out, -10.0, 10.0)
         
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
         # W -= eta * grad + eta * 2 * lambda_w * W
-        w_rec -= self.eta * grad_rec_clipped + self.eta * (2 * self.lambda_w) * w_rec
-        w_out -= self.eta * grad_out_clipped + self.eta * (2 * self.lambda_w) * w_out
+        # w_rec -= self.eta * grad_rec_clipped + self.eta * (2 * self.lambda_w) * w_rec
+        # w_out -= self.eta * grad_out_clipped + self.eta * (2 * self.lambda_w) * w_out
 
-        # w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
-        # w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
+        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
+        w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
