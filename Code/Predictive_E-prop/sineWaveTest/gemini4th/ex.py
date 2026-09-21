@@ -114,6 +114,8 @@ class EPropOptimizer:
         
         self.grad_w_rec = np.zeros((n_neurons, n_neurons))
         self.grad_w_out = np.zeros((n_outputs, n_neurons))
+        self.grad_w_rec_accumulated = np.zeros((n_neurons, n_neurons))
+        self.grad_w_out_accumulated = np.zeros((n_outputs, n_neurons))
         
         self.spike_buffer = np.zeros(n_neurons)
         self.e_trace_sum = np.zeros((n_neurons, n_neurons))
@@ -124,6 +126,8 @@ class EPropOptimizer:
         self.eps_b.fill(0)
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
+        self.grad_w_rec_accumulated.fill(0)
+        self.grad_w_out_accumulated.fill(0)
         self.spike_buffer.fill(0)
         self.e_trace_sum.fill(0)
         self.step_counter = 0
@@ -146,26 +150,34 @@ class EPropOptimizer:
             # Eq. 10: e_ij^t = psi_i^t * (z_bar_j^{t-1} - beta * eps_b,ij^t)
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
         
+        # 毎ステップの勾配を蓄積
         # Eq. 3: Delta W_ij^rec = eta * sum_t ( L_i^t * e_ij^t )
-        self.grad_w_rec += L_t[:, None] * self.e_trace
+        self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
         # Eq. 11: Delta W_ij^out = eta * sum_t ( (y_i^t - x_i^t) * z_bar_j^t )
-        self.grad_w_out += np.outer(error_t, z_bar_curr)
+        self.grad_w_out_accumulated += np.outer(error_t, z_bar_curr)
         
         all_spikes = np.concatenate([g.z for g in neurons])
         self.spike_buffer += all_spikes
         self.e_trace_sum += self.e_trace
         self.step_counter += 1
         
-        # Eq. S1 & S3: ホメオスタシス正則化 (Homeostatic plasticity / Firing rate regularization)
-        # f_bar_i = (1 / t_delay) * sum_t z_i^t
+        # t_delayごとに更新判定を返す
         if self.step_counter >= self.t_delay:
+            # t_delay間の蓄積勾配を実際の更新用勾配へコピー
+            self.grad_w_rec = self.grad_w_rec_accumulated.copy()
+            self.grad_w_out = self.grad_w_out_accumulated.copy()
+
+            # Eq. S1 & S3: ホメオスタシス正則化 (Homeostatic plasticity / Firing rate regularization)
             f_bar = self.spike_buffer / self.t_delay
             # d(E_reg)/dW_ij^rec = (lambda_reg / t_delay) * (f_bar_i - f^*) * sum e_ij
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
             self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
             
+            # バッファクリア
             self.spike_buffer.fill(0)
             self.e_trace_sum.fill(0)
+            self.grad_w_rec_accumulated.fill(0)
+            self.grad_w_out_accumulated.fill(0)
             self.step_counter = 0
             return True
         return False
