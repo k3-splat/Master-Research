@@ -77,7 +77,7 @@ class LIFGroup(BaseNeuronGroup):
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 class ALIFGroup(BaseNeuronGroup):
-    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.05, **kwargs):
+    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.5, **kwargs):
         super().__init__(n_neurons, **kwargs)
         # Section 2.1: rho = exp(-dt / tau_alif)
         self.rho = np.exp(-self.dt / tau_alif)
@@ -229,7 +229,7 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.05
+        self.sigma_s = 1.0
         self.s = np.zeros(self.n_neurons)
         
         self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
