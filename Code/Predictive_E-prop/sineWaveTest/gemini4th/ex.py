@@ -2,6 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import datetime
 
+# 時間窓の可能性
+
 # ==========================================
 # ニューロンモデル
 # ==========================================
