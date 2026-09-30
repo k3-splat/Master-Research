@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 # オルナシュテイン-ウーレンベック過程のパラメータ
 theta = 0.1
 mu = 0.5
-sigma = 0.2
+sigma = 1.0
 
 # 数値解法（オイラー・マリュマ法）
 def ornstein_uhlenbeck_simulation(dt, T):

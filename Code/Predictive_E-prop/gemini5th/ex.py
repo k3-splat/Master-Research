@@ -2,8 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import datetime
 
-# 時間窓の可能性
-
 # ==========================================
 # ニューロンモデル
 # ==========================================
@@ -116,11 +114,13 @@ class EPropOptimizer:
         
         self.grad_w_rec = np.zeros((n_neurons, n_neurons))
         self.grad_w_out = np.zeros((n_outputs, n_neurons))
+        
+        # t_delay区間内でのみ累積する変数
         self.grad_w_rec_accumulated = np.zeros((n_neurons, n_neurons))
         self.grad_w_out_accumulated = np.zeros((n_outputs, n_neurons))
-        
         self.spike_buffer = np.zeros(n_neurons)
         self.e_trace_sum = np.zeros((n_neurons, n_neurons))
+        
         self.step_counter = 0
 
     def reset_traces(self):
@@ -152,7 +152,7 @@ class EPropOptimizer:
             # Eq. 10: e_ij^t = psi_i^t * (z_bar_j^{t-1} - beta * eps_b,ij^t)
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
         
-        # 毎ステップの勾配を蓄積
+        # 毎ステップの勾配を t_delay 区間内でのみ蓄積
         # Eq. 3: Delta W_ij^rec = eta * sum_t ( L_i^t * e_ij^t )
         self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
         # Eq. 11: Delta W_ij^out = eta * sum_t ( (y_i^t - x_i^t) * z_bar_j^t )
@@ -175,24 +175,19 @@ class EPropOptimizer:
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
             self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
             
-            # バッファクリア
+            # 該当のバッファを t_delay ごとに完全にリセット（全時間ステップでの和とならないようにする）
             self.spike_buffer.fill(0)
             self.e_trace_sum.fill(0)
             self.grad_w_rec_accumulated.fill(0)
             self.grad_w_out_accumulated.fill(0)
             self.step_counter = 0
+            
             return True
         return False
 
     def apply_weight_update(self, w_rec, w_out):
-        # grad_rec_clipped = np.clip(self.grad_w_rec, -10.0, 10.0)
-        # grad_out_clipped = np.clip(self.grad_w_out, -10.0, 10.0)
-        
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
         # W -= eta * grad + eta * 2 * lambda_w * W
-        # w_rec -= self.eta * grad_rec_clipped + self.eta * (2 * self.lambda_w) * w_rec
-        # w_out -= self.eta * grad_out_clipped + self.eta * (2 * self.lambda_w) * w_out
-
         w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
@@ -231,9 +226,8 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.02
-        self.mu_s = 0.0
-        self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
+        self.sigma_s = 1.0
+        self.s = np.zeros(self.n_neurons)
         
         self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
 
@@ -245,9 +239,7 @@ class PredictiveEPropNet:
 
     def generate_ou_noise(self, dt=1.0):
         # Section 2.1: Ornstein-Uhlenbeck noise s
-        # self.s += - (self.s / self.tau_s) * dt + self.sigma_s * np.sqrt(2 / self.tau_s) * np.random.randn(self.n_neurons)
-        decay = np.exp(-dt / self.tau_s)
-        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
+        self.s += - (self.s / self.tau_s) * dt + self.sigma_s * np.sqrt(2 / self.tau_s) * np.random.randn(self.n_neurons)
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0):
@@ -273,7 +265,6 @@ class PredictiveEPropNet:
 
             x_t = target_signal[t]
             
-            # 【修正】z_bar ではなく z_bar_bar (二重指数フィルタ後) を用いて出力を計算
             # Section 2.1: y_i^t = sum_k W_ik^out * z_bar_bar_i^t
             all_z_bar_bar = np.concatenate([self.lif.z_bar_bar, self.alif.z_bar_bar])
             all_z_bar = np.concatenate([self.lif.z_bar, self.alif.z_bar])
@@ -285,7 +276,6 @@ class PredictiveEPropNet:
             d_t = y_t - x_t
             s_t = self.generate_ou_noise(dt)
             
-            # 【修正】i_rec の計算に z_bar_bar を使用
             # Eq. 1: 入力電流統合 (sum W_ij^rec * z_bar_bar_j^t)
             i_rec = self.w_rec @ all_z_bar_bar
             i_in = self.w_in @ d_t
