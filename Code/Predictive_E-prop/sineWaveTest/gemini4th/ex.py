@@ -245,7 +245,6 @@ class PredictiveEPropNet:
 
     def generate_ou_noise(self, dt=1.0):
         # Section 2.1: Ornstein-Uhlenbeck noise s
-        # self.s += - (self.s / self.tau_s) * dt + self.sigma_s * np.sqrt(2 / self.tau_s) * np.random.randn(self.n_neurons)
         decay = np.exp(-dt / self.tau_s)
         self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s
