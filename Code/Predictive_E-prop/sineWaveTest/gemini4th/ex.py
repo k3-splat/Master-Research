@@ -231,7 +231,7 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.02
+        self.sigma_s = 1.0
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
         
