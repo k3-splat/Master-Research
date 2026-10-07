@@ -2,8 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import datetime
 
-# 時間窓の可能性
-
 # ==========================================
 # ニューロンモデル
 # ==========================================
@@ -37,25 +35,25 @@ class BaseNeuronGroup:
 
     def _update_spikes_and_filters(self, v_next_raw, b_next):
         # Eq. 7: テンソル微分の近似 (Tent surrogate gradient)
-        # psi_i^t = (gamma_d / v_th) * max(0, 1 - |(v_i^t - b_i^t) / v_th|)
         self.psi = (self.gamma_d / self.v_th) * np.maximum(0, 1.0 - np.abs((v_next_raw - b_next) / self.v_th))
         
+        # 【追加】不応期中の擬似微分を0にマスクする（幻の勾配を防ぐ）
+        is_currently_refractory = self.ref_counts > 0
+        self.psi[is_currently_refractory] = 0.0
+        
         # Eq. 1: z_i^t = theta(v_i^t - b_i^t) (不応期考慮)
-        self.z = np.where((v_next_raw > b_next) & (self.ref_counts <= 0), 1.0, 0.0)
+        self.z = np.where((v_next_raw > b_next) & (~is_currently_refractory), 1.0, 0.0)
         
         # Eq. 1: Repolarization mechanism (- z_i^t * b_i^t)
         v_next = v_next_raw - self.z * b_next
         
         # Section 2.1: 不応期の適用 (5 ms)
-        is_refractory = self.ref_counts > 0
-        v_next[is_refractory] = self.v[is_refractory]
+        v_next[is_currently_refractory] = self.v[is_currently_refractory]
         
         self.ref_counts = np.maximum(0, self.ref_counts - self.dt)
         self.ref_counts[self.z > 0] = self.t_ref
         
         # Eq. 2: 2重指数関数フィルター (Double exponential filter)
-        # q_i^t = exp(-dt / tau_r) * q_i^{t-1} + (1 / (tau_r * tau_d)) * z_i^t
-        # z_bar_bar_i^t = exp(-dt / tau_d) * z_bar_bar_i^{t-1} + q_i^{t-1}
         q_prev = self.q.copy()
         self.q = self.decay_r * self.q + self.c_rd * self.z
         self.z_bar_bar = self.decay_d * self.z_bar_bar + q_prev
@@ -103,7 +101,7 @@ class ALIFGroup(BaseNeuronGroup):
 # 最適化手法 (Predictive E-prop)
 # ==========================================
 class EPropOptimizer:
-    def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
+    def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=10000):
         self.n_neurons = n_neurons
         self.eta = eta
         self.lambda_reg = lambda_reg
@@ -185,14 +183,7 @@ class EPropOptimizer:
         return False
 
     def apply_weight_update(self, w_rec, w_out):
-        # grad_rec_clipped = np.clip(self.grad_w_rec, -10.0, 10.0)
-        # grad_out_clipped = np.clip(self.grad_w_out, -10.0, 10.0)
-        
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        # W -= eta * grad + eta * 2 * lambda_w * W
-        # w_rec -= self.eta * grad_rec_clipped + self.eta * (2 * self.lambda_w) * w_rec
-        # w_out -= self.eta * grad_out_clipped + self.eta * (2 * self.lambda_w) * w_out
-
         w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
@@ -222,6 +213,10 @@ class PredictiveEPropNet:
         # Section 2.1 & Table SI: W^rec ~ N(0, 1) / sqrt(N_rec), Sparsity = 0.99 (結合密度 1%)
         density = 0.01
         self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < density).astype(float)
+        
+        # 【追加】自己結合（対角成分）を無効化
+        np.fill_diagonal(self.w_rec_mask, 0.0)
+        
         self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
         
         # Section 2.1: W^out ~ N(0, 1) / sqrt(N_rec)
@@ -272,7 +267,7 @@ class PredictiveEPropNet:
 
             x_t = target_signal[t]
             
-            # 【修正】z_bar ではなく z_bar_bar (二重指数フィルタ後) を用いて出力を計算
+            # z_bar_bar (二重指数フィルタ後) を用いて出力を計算
             # Section 2.1: y_i^t = sum_k W_ik^out * z_bar_bar_i^t
             all_z_bar_bar = np.concatenate([self.lif.z_bar_bar, self.alif.z_bar_bar])
             all_z_bar = np.concatenate([self.lif.z_bar, self.alif.z_bar])
@@ -284,7 +279,6 @@ class PredictiveEPropNet:
             d_t = y_t - x_t
             s_t = self.generate_ou_noise(dt)
             
-            # 【修正】i_rec の計算に z_bar_bar を使用
             # Eq. 1: 入力電流統合 (sum W_ij^rec * z_bar_bar_j^t)
             i_rec = self.w_rec @ all_z_bar_bar
             i_in = self.w_in @ d_t
@@ -308,7 +302,7 @@ class PredictiveEPropNet:
                 
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
-                    # スパース結合構造の維持
+                    # スパース結合構造と対角成分0の維持
                     self.w_rec *= self.w_rec_mask
                 
                 z_bar_prev_prev = z_bar_prev.copy()
