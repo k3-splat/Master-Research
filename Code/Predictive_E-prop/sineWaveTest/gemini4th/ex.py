@@ -101,7 +101,7 @@ class ALIFGroup(BaseNeuronGroup):
 # 最適化手法 (Predictive E-prop)
 # ==========================================
 class EPropOptimizer:
-    def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=10000):
+    def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
         self.eta = eta
         self.lambda_reg = lambda_reg
@@ -226,7 +226,7 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 1.0
+        self.sigma_s = 0.05
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
         
