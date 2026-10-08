@@ -7,7 +7,7 @@ import os
 # ニューロンモデル
 # ==========================================
 class BaseNeuronGroup:
-    def __init__(self, n_neurons, dt=1.0, tau_mem=20.0, tau_r=5.00, tau_d=12.50, v_th=0.6, gamma_d=0.3, t_ref=5.0):
+    def __init__(self, n_neurons, dt=1.0, tau_mem=20.0, tau_r=50.0, tau_d=125.0, v_th=0.6, gamma_d=0.3, t_ref=5.0):
         self.n = n_neurons
         self.dt = dt
         # パラメータ出力用に保持
@@ -84,7 +84,7 @@ class LIFGroup(BaseNeuronGroup):
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 class ALIFGroup(BaseNeuronGroup):
-    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.5, **kwargs):
+    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.0174, **kwargs):
         super().__init__(n_neurons, **kwargs)
         # パラメータ出力用に保持
         self.tau_alif = tau_alif
