@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
+import os
 
 # ==========================================
 # ニューロンモデル
@@ -9,16 +10,22 @@ class BaseNeuronGroup:
     def __init__(self, n_neurons, dt=1.0, tau_mem=20.0, tau_r=5.00, tau_d=12.50, v_th=0.6, gamma_d=0.3, t_ref=5.0):
         self.n = n_neurons
         self.dt = dt
+        # パラメータ出力用に保持
+        self.tau_mem = tau_mem
+        self.tau_r = tau_r
+        self.tau_d = tau_d
+        self.v_th = v_th
+        self.gamma_d = gamma_d
+        self.t_ref = t_ref
+        
         # Eq. 1: alpha = exp(-dt / tau_mem)
         self.alpha = np.exp(-dt / tau_mem)
         # Eq. 2: decay constants for double exponential filter
         self.decay_r = np.exp(-dt / tau_r)
         self.decay_d = np.exp(-dt / tau_d)
-        self.v_th = v_th
-        self.gamma_d = gamma_d
+        
         # Eq. 2 & Eq. 5: c_rd = 1 / (tau_r * tau_d)
         self.c_rd = 1.0 / (tau_r * tau_d)
-        self.t_ref = t_ref
         
         self.reset_state()
 
@@ -79,9 +86,11 @@ class LIFGroup(BaseNeuronGroup):
 class ALIFGroup(BaseNeuronGroup):
     def __init__(self, n_neurons, tau_alif=2000.0, beta=0.5, **kwargs):
         super().__init__(n_neurons, **kwargs)
+        # パラメータ出力用に保持
+        self.tau_alif = tau_alif
+        self.beta = beta
         # Section 2.1: rho = exp(-dt / tau_alif)
         self.rho = np.exp(-self.dt / tau_alif)
-        self.beta = beta
         self.a = np.zeros(self.n)
 
     def reset_state(self):
@@ -103,6 +112,7 @@ class ALIFGroup(BaseNeuronGroup):
 class EPropOptimizer:
     def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
+        # パラメータ出力用に保持
         self.eta = eta
         self.lambda_reg = lambda_reg
         self.lambda_w = lambda_w
@@ -201,6 +211,8 @@ class PredictiveEPropNet:
         self.n_alif = n_alif
         self.n_neurons = n_lif + n_alif
         self.n_outputs = n_outputs
+        # パラメータ出力用に保持
+        self.g = g
         
         self.lif = LIFGroup(n_lif)
         self.alif = ALIFGroup(n_alif)
@@ -211,8 +223,8 @@ class PredictiveEPropNet:
         self.w_fb = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(g)
         
         # Section 2.1 & Table SI: W^rec ~ N(0, 1) / sqrt(N_rec), Sparsity = 0.99 (結合密度 1%)
-        density = 0.01
-        self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < density).astype(float)
+        self.density = 0.01
+        self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
         
         # 【追加】自己結合（対角成分）を無効化
         np.fill_diagonal(self.w_rec_mask, 0.0)
@@ -224,9 +236,10 @@ class PredictiveEPropNet:
         # Eq. 5: Broadcast alignment matrix B
         self.B = np.random.randn(self.n_neurons, n_outputs)
         
+        # パラメータ出力用に保持
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.05
+        self.sigma_s = 1.0
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
         
@@ -318,7 +331,14 @@ if __name__ == "__main__":
     # Table SI: 正弦波タスクのパラメータ設定
     # A = 0.4, T = 1000 ms, phi = 0, c = 0
     A, T, phi, c = 0.4, 1000.0, 0.0, 0.0
-    t_all = np.arange(0, 20000, 1)
+    
+    # フェーズ長の設定 (パラメータ出力用に明示的変数化)
+    len_train = 10000
+    len_error = 5000
+    len_free = 5000
+    total_time = len_train + len_error + len_free
+    
+    t_all = np.arange(0, total_time, 1)
     
     # Eq. 14: x(t) = A * sin((2 * pi / T) * t + phi) + c
     def sine_wave(t_array):
@@ -337,38 +357,86 @@ if __name__ == "__main__":
         out_all = net.run_full_epoch(target_all)
         
         # Eq. 4: 評価用平均二乗誤差 (Loss = mean((y - x)^2))
-        loss_train = np.mean((out_all[:10000] - target_all[:10000])**2)
-        loss_error = np.mean((out_all[10000:15000] - target_all[10000:15000])**2)
-        loss_free = np.mean((out_all[15000:] - target_all[15000:])**2)
+        loss_train = np.mean((out_all[:len_train] - target_all[:len_train])**2)
+        loss_error = np.mean((out_all[len_train:len_train+len_error] - target_all[len_train:len_train+len_error])**2)
+        loss_free = np.mean((out_all[len_train+len_error:] - target_all[len_train+len_error:])**2)
         
         print(f"  Training Loss: {loss_train:.5f}")
         print(f"  Error-driven Loss: {loss_error:.5f}")
         print(f"  Free-running Loss: {loss_free:.5f}")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"output/predictive_eprop_result_{timestamp}.png"
+    
+    # 出力先ディレクトリの確保
+    os.makedirs("output", exist_ok=True)
+    
+    # --- 画像ファイルの出力 ---
+    img_filename = f"output/predictive_eprop_result_{timestamp}.png"
     
     fig, axes = plt.subplots(3, 1, figsize=(10, 8))
     
-    axes[0].plot(t_all[:10000], target_all[:10000], label="Target", color="black", linestyle="--")
-    axes[0].plot(t_all[:10000], out_all[:10000], label="Output", color="blue", alpha=0.7)
+    axes[0].plot(t_all[:len_train], target_all[:len_train], label="Target", color="black", linestyle="--")
+    axes[0].plot(t_all[:len_train], out_all[:len_train], label="Output", color="blue", alpha=0.7)
     axes[0].set_title("Training Phase")
     axes[0].set_ylabel("Signal")
     axes[0].legend(loc="upper right")
     
-    axes[1].plot(t_all[10000:15000], target_all[10000:15000], label="Target", color="black", linestyle="--")
-    axes[1].plot(t_all[10000:15000], out_all[10000:15000], label="Output", color="orange", alpha=0.7)
+    axes[1].plot(t_all[len_train:len_train+len_error], target_all[len_train:len_train+len_error], label="Target", color="black", linestyle="--")
+    axes[1].plot(t_all[len_train:len_train+len_error], out_all[len_train:len_train+len_error], label="Output", color="orange", alpha=0.7)
     axes[1].set_title("Error-driven Phase")
     axes[1].set_ylabel("Signal")
     axes[1].legend(loc="upper right")
     
-    axes[2].plot(t_all[15000:], target_all[15000:], label="Target", color="black", linestyle="--")
-    axes[2].plot(t_all[15000:], out_all[15000:], label="Output", color="green", alpha=0.7)
+    axes[2].plot(t_all[len_train+len_error:], target_all[len_train+len_error:], label="Target", color="black", linestyle="--")
+    axes[2].plot(t_all[len_train+len_error:], out_all[len_train+len_error:], label="Output", color="green", alpha=0.7)
     axes[2].set_title("Free-running Phase")
     axes[2].set_xlabel("Time [ms]")
     axes[2].set_ylabel("Signal")
     axes[2].legend(loc="upper right")
     
     plt.tight_layout()
-    plt.savefig(filename)
-    print(f"\nプロットを画像ファイル '{filename}' として保存しました。")
+    plt.savefig(img_filename)
+    print(f"\nプロットを画像ファイル '{img_filename}' として保存しました。")
+    
+    # --- スクリプトで使用されたパラメータのファイル出力 ---
+    param_filename = f"output/predictive_eprop_params_{timestamp}.txt"
+    
+    # クラスインスタンス等から実行時の実際の値を抽出
+    actual_params = {
+        "training phase (ms)": len_train,
+        "error-driven phase (ms)": len_error,
+        "free-running phase (ms)": len_free,
+        "eta (η)": net.optimizer.eta,
+        "lambda_W": net.optimizer.lambda_w,
+        "lambda_reg": net.optimizer.lambda_reg,
+        "gamma_d": net.lif.gamma_d,
+        "time step (dt)": net.lif.dt,
+        "t_delay": net.optimizer.t_delay,
+        "f_star": net.optimizer.f_star,
+        "A": A,
+        "T": T,
+        "phi (φ)": phi,
+        "c": c,
+        "N_LIF": net.n_lif,
+        "N_ALIF": net.n_alif,
+        "sparsity": 1.0 - net.density, # densityからsparsityへ変換
+        "tau_s": net.tau_s,
+        "sigma_s": net.sigma_s,
+        "mu_s": net.mu_s,
+        "g": net.g,
+        "v_th": net.lif.v_th,
+        "I_bias": net.I_bias,
+        "tau_mem": net.lif.tau_mem,
+        "tau_alif": net.alif.tau_alif,
+        "tau_r": net.lif.tau_r,
+        "tau_d": net.lif.tau_d,
+        "t_ref": net.lif.t_ref
+    }
+
+    with open(param_filename, "w", encoding="utf-8") as f:
+        f.write("スクリプト内で使用されたハイパーパラメータ一覧\n")
+        f.write("=" * 60 + "\n")
+        for key, value in actual_params.items():
+            f.write(f"{key}: {value}\n")
+            
+    print(f"スクリプトで使用されたパラメータ数値をテキストファイル '{param_filename}' として保存しました。")

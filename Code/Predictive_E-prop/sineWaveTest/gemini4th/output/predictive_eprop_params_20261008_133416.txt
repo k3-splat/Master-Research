@@ -1,0 +1,30 @@
+スクリプト内で使用されたハイパーパラメータ一覧
+============================================================
+training phase (ms): 10000
+error-driven phase (ms): 5000
+free-running phase (ms): 5000
+eta (η): 0.0004
+lambda_W: 5e-06
+lambda_reg: 2.0
+gamma_d: 0.3
+time step (dt): 1.0
+t_delay: 10
+f_star: 0.01
+A: 0.4
+T: 1000.0
+phi (φ): 0.0
+c: 0.0
+N_LIF: 100
+N_ALIF: 200
+sparsity: 0.99
+tau_s: 250.0
+sigma_s: 1.0
+mu_s: 0.0
+g: 150.0
+v_th: 0.6
+I_bias: 0.02
+tau_mem: 20.0
+tau_alif: 2000.0
+tau_r: 5.0
+tau_d: 12.5
+t_ref: 5.0
