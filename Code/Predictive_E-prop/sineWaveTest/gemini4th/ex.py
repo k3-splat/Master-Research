@@ -6,7 +6,7 @@ import datetime
 # ニューロンモデル
 # ==========================================
 class BaseNeuronGroup:
-    def __init__(self, n_neurons, dt=1.0, tau_mem=20.0, tau_r=50.0, tau_d=125.0, v_th=0.6, gamma_d=0.3, t_ref=5.0):
+    def __init__(self, n_neurons, dt=1.0, tau_mem=20.0, tau_r=5.00, tau_d=12.50, v_th=0.6, gamma_d=0.3, t_ref=5.0):
         self.n = n_neurons
         self.dt = dt
         # Eq. 1: alpha = exp(-dt / tau_mem)
