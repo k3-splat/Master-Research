@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
+import os
 
 # ==========================================
 # ニューロンモデル
@@ -9,16 +10,22 @@ class BaseNeuronGroup:
     def __init__(self, n_neurons, dt=1.0, tau_mem=20.0, tau_r=50.0, tau_d=125.0, v_th=0.6, gamma_d=0.3, t_ref=5.0):
         self.n = n_neurons
         self.dt = dt
+        # パラメータ出力用に保持
+        self.tau_mem = tau_mem
+        self.tau_r = tau_r
+        self.tau_d = tau_d
+        self.v_th = v_th
+        self.gamma_d = gamma_d
+        self.t_ref = t_ref
+        
         # Eq. 1: alpha = exp(-dt / tau_mem)
         self.alpha = np.exp(-dt / tau_mem)
         # Eq. 2: decay constants for double exponential filter
         self.decay_r = np.exp(-dt / tau_r)
         self.decay_d = np.exp(-dt / tau_d)
-        self.v_th = v_th
-        self.gamma_d = gamma_d
+        
         # Eq. 2 & Eq. 5: c_rd = 1 / (tau_r * tau_d)
         self.c_rd = 1.0 / (tau_r * tau_d)
-        self.t_ref = t_ref
         
         self.reset_state()
 
@@ -35,25 +42,25 @@ class BaseNeuronGroup:
 
     def _update_spikes_and_filters(self, v_next_raw, b_next):
         # Eq. 7: テンソル微分の近似 (Tent surrogate gradient)
-        # psi_i^t = (gamma_d / v_th) * max(0, 1 - |(v_i^t - b_i^t) / v_th|)
         self.psi = (self.gamma_d / self.v_th) * np.maximum(0, 1.0 - np.abs((v_next_raw - b_next) / self.v_th))
         
+        # 【追加】不応期中の擬似微分を0にマスクする（幻の勾配を防ぐ）
+        is_currently_refractory = self.ref_counts > 0
+        self.psi[is_currently_refractory] = 0.0
+        
         # Eq. 1: z_i^t = theta(v_i^t - b_i^t) (不応期考慮)
-        self.z = np.where((v_next_raw > b_next) & (self.ref_counts <= 0), 1.0, 0.0)
+        self.z = np.where((v_next_raw > b_next) & (~is_currently_refractory), 1.0, 0.0)
         
         # Eq. 1: Repolarization mechanism (- z_i^t * b_i^t)
         v_next = v_next_raw - self.z * b_next
         
         # Section 2.1: 不応期の適用 (5 ms)
-        is_refractory = self.ref_counts > 0
-        v_next[is_refractory] = self.v[is_refractory]
+        v_next[is_currently_refractory] = self.v[is_currently_refractory]
         
         self.ref_counts = np.maximum(0, self.ref_counts - self.dt)
         self.ref_counts[self.z > 0] = self.t_ref
         
         # Eq. 2: 2重指数関数フィルター (Double exponential filter)
-        # q_i^t = exp(-dt / tau_r) * q_i^{t-1} + (1 / (tau_r * tau_d)) * z_i^t
-        # z_bar_bar_i^t = exp(-dt / tau_d) * z_bar_bar_i^{t-1} + q_i^{t-1}
         q_prev = self.q.copy()
         self.q = self.decay_r * self.q + self.c_rd * self.z
         self.z_bar_bar = self.decay_d * self.z_bar_bar + q_prev
@@ -77,11 +84,13 @@ class LIFGroup(BaseNeuronGroup):
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 class ALIFGroup(BaseNeuronGroup):
-    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.5, **kwargs):
+    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.0174, **kwargs):
         super().__init__(n_neurons, **kwargs)
+        # パラメータ出力用に保持
+        self.tau_alif = tau_alif
+        self.beta = beta
         # Section 2.1: rho = exp(-dt / tau_alif)
         self.rho = np.exp(-self.dt / tau_alif)
-        self.beta = beta
         self.a = np.zeros(self.n)
 
     def reset_state(self):
@@ -103,6 +112,7 @@ class ALIFGroup(BaseNeuronGroup):
 class EPropOptimizer:
     def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
+        # パラメータ出力用に保持
         self.eta = eta
         self.lambda_reg = lambda_reg
         self.lambda_w = lambda_w
@@ -114,13 +124,11 @@ class EPropOptimizer:
         
         self.grad_w_rec = np.zeros((n_neurons, n_neurons))
         self.grad_w_out = np.zeros((n_outputs, n_neurons))
-        
-        # t_delay区間内でのみ累積する変数
         self.grad_w_rec_accumulated = np.zeros((n_neurons, n_neurons))
         self.grad_w_out_accumulated = np.zeros((n_outputs, n_neurons))
+        
         self.spike_buffer = np.zeros(n_neurons)
         self.e_trace_sum = np.zeros((n_neurons, n_neurons))
-        
         self.step_counter = 0
 
     def reset_traces(self):
@@ -152,7 +160,7 @@ class EPropOptimizer:
             # Eq. 10: e_ij^t = psi_i^t * (z_bar_j^{t-1} - beta * eps_b,ij^t)
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
         
-        # 毎ステップの勾配を t_delay 区間内でのみ蓄積
+        # 毎ステップの勾配を蓄積
         # Eq. 3: Delta W_ij^rec = eta * sum_t ( L_i^t * e_ij^t )
         self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
         # Eq. 11: Delta W_ij^out = eta * sum_t ( (y_i^t - x_i^t) * z_bar_j^t )
@@ -175,19 +183,17 @@ class EPropOptimizer:
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
             self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
             
-            # 該当のバッファを t_delay ごとに完全にリセット（全時間ステップでの和とならないようにする）
+            # バッファクリア
             self.spike_buffer.fill(0)
             self.e_trace_sum.fill(0)
             self.grad_w_rec_accumulated.fill(0)
             self.grad_w_out_accumulated.fill(0)
             self.step_counter = 0
-            
             return True
         return False
 
     def apply_weight_update(self, w_rec, w_out):
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        # W -= eta * grad + eta * 2 * lambda_w * W
         w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
@@ -205,6 +211,8 @@ class PredictiveEPropNet:
         self.n_alif = n_alif
         self.n_neurons = n_lif + n_alif
         self.n_outputs = n_outputs
+        # パラメータ出力用に保持
+        self.g = g
         
         self.lif = LIFGroup(n_lif)
         self.alif = ALIFGroup(n_alif)
@@ -215,8 +223,12 @@ class PredictiveEPropNet:
         self.w_fb = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(g)
         
         # Section 2.1 & Table SI: W^rec ~ N(0, 1) / sqrt(N_rec), Sparsity = 0.99 (結合密度 1%)
-        density = 0.01
-        self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < density).astype(float)
+        self.density = 0.01
+        self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
+        
+        # 【追加】自己結合（対角成分）を無効化
+        np.fill_diagonal(self.w_rec_mask, 0.0)
+        
         self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
         
         # Section 2.1: W^out ~ N(0, 1) / sqrt(N_rec)
@@ -224,10 +236,12 @@ class PredictiveEPropNet:
         # Eq. 5: Broadcast alignment matrix B
         self.B = np.random.randn(self.n_neurons, n_outputs)
         
+        # パラメータ出力用に保持
         self.I_bias = 0.02
         self.tau_s = 250.0
         self.sigma_s = 1.0
-        self.s = np.zeros(self.n_neurons)
+        self.mu_s = 0.0
+        self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
         
         self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
 
@@ -239,11 +253,19 @@ class PredictiveEPropNet:
 
     def generate_ou_noise(self, dt=1.0):
         # Section 2.1: Ornstein-Uhlenbeck noise s
-        self.s += - (self.s / self.tau_s) * dt + self.sigma_s * np.sqrt(2 / self.tau_s) * np.random.randn(self.n_neurons)
+        decay = np.exp(-dt / self.tau_s)
+        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0):
         self.reset_state()
+        
+        # 【変更箇所】各エポックごとにマスクw_rec_maskをリセット（再生成）
+        self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
+        np.fill_diagonal(self.w_rec_mask, 0.0)
+        # 再生成したマスクを現在のw_recに適用
+        self.w_rec *= self.w_rec_mask
+        
         timesteps = len(target_signal)
         outputs = np.zeros((timesteps, self.n_outputs))
         
@@ -265,6 +287,7 @@ class PredictiveEPropNet:
 
             x_t = target_signal[t]
             
+            # z_bar_bar (二重指数フィルタ後) を用いて出力を計算
             # Section 2.1: y_i^t = sum_k W_ik^out * z_bar_bar_i^t
             all_z_bar_bar = np.concatenate([self.lif.z_bar_bar, self.alif.z_bar_bar])
             all_z_bar = np.concatenate([self.lif.z_bar, self.alif.z_bar])
@@ -299,7 +322,7 @@ class PredictiveEPropNet:
                 
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
-                    # スパース結合構造の維持
+                    # スパース結合構造と対角成分0の維持
                     self.w_rec *= self.w_rec_mask
                 
                 z_bar_prev_prev = z_bar_prev.copy()
@@ -315,7 +338,14 @@ if __name__ == "__main__":
     # Table SI: 正弦波タスクのパラメータ設定
     # A = 0.4, T = 1000 ms, phi = 0, c = 0
     A, T, phi, c = 0.4, 1000.0, 0.0, 0.0
-    t_all = np.arange(0, 20000, 1)
+    
+    # フェーズ長の設定 (パラメータ出力用に明示的変数化)
+    len_train = 10000
+    len_error = 5000
+    len_free = 5000
+    total_time = len_train + len_error + len_free
+    
+    t_all = np.arange(0, total_time, 1)
     
     # Eq. 14: x(t) = A * sin((2 * pi / T) * t + phi) + c
     def sine_wave(t_array):
@@ -334,38 +364,86 @@ if __name__ == "__main__":
         out_all = net.run_full_epoch(target_all)
         
         # Eq. 4: 評価用平均二乗誤差 (Loss = mean((y - x)^2))
-        loss_train = np.mean((out_all[:10000] - target_all[:10000])**2)
-        loss_error = np.mean((out_all[10000:15000] - target_all[10000:15000])**2)
-        loss_free = np.mean((out_all[15000:] - target_all[15000:])**2)
+        loss_train = np.mean((out_all[:len_train] - target_all[:len_train])**2)
+        loss_error = np.mean((out_all[len_train:len_train+len_error] - target_all[len_train:len_train+len_error])**2)
+        loss_free = np.mean((out_all[len_train+len_error:] - target_all[len_train+len_error:])**2)
         
         print(f"  Training Loss: {loss_train:.5f}")
         print(f"  Error-driven Loss: {loss_error:.5f}")
         print(f"  Free-running Loss: {loss_free:.5f}")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"output/predictive_eprop_result_{timestamp}.png"
+    
+    # 出力先ディレクトリの確保
+    os.makedirs("output", exist_ok=True)
+    
+    # --- 画像ファイルの出力 ---
+    img_filename = f"output/predictive_eprop_result_{timestamp}.png"
     
     fig, axes = plt.subplots(3, 1, figsize=(10, 8))
     
-    axes[0].plot(t_all[:10000], target_all[:10000], label="Target", color="black", linestyle="--")
-    axes[0].plot(t_all[:10000], out_all[:10000], label="Output", color="blue", alpha=0.7)
+    axes[0].plot(t_all[:len_train], target_all[:len_train], label="Target", color="black", linestyle="--")
+    axes[0].plot(t_all[:len_train], out_all[:len_train], label="Output", color="blue", alpha=0.7)
     axes[0].set_title("Training Phase")
     axes[0].set_ylabel("Signal")
     axes[0].legend(loc="upper right")
     
-    axes[1].plot(t_all[10000:15000], target_all[10000:15000], label="Target", color="black", linestyle="--")
-    axes[1].plot(t_all[10000:15000], out_all[10000:15000], label="Output", color="orange", alpha=0.7)
+    axes[1].plot(t_all[len_train:len_train+len_error], target_all[len_train:len_train+len_error], label="Target", color="black", linestyle="--")
+    axes[1].plot(t_all[len_train:len_train+len_error], out_all[len_train:len_train+len_error], label="Output", color="orange", alpha=0.7)
     axes[1].set_title("Error-driven Phase")
     axes[1].set_ylabel("Signal")
     axes[1].legend(loc="upper right")
     
-    axes[2].plot(t_all[15000:], target_all[15000:], label="Target", color="black", linestyle="--")
-    axes[2].plot(t_all[15000:], out_all[15000:], label="Output", color="green", alpha=0.7)
+    axes[2].plot(t_all[len_train+len_error:], target_all[len_train+len_error:], label="Target", color="black", linestyle="--")
+    axes[2].plot(t_all[len_train+len_error:], out_all[len_train+len_error:], label="Output", color="green", alpha=0.7)
     axes[2].set_title("Free-running Phase")
     axes[2].set_xlabel("Time [ms]")
     axes[2].set_ylabel("Signal")
     axes[2].legend(loc="upper right")
     
     plt.tight_layout()
-    plt.savefig(filename)
-    print(f"\nプロットを画像ファイル '{filename}' として保存しました。")
+    plt.savefig(img_filename)
+    print(f"\nプロットを画像ファイル '{img_filename}' として保存しました。")
+    
+    # --- スクリプトで使用されたパラメータのファイル出力 ---
+    param_filename = f"output/predictive_eprop_params_{timestamp}.txt"
+    
+    # クラスインスタンス等から実行時の実際の値を抽出
+    actual_params = {
+        "training phase (ms)": len_train,
+        "error-driven phase (ms)": len_error,
+        "free-running phase (ms)": len_free,
+        "eta (η)": net.optimizer.eta,
+        "lambda_W": net.optimizer.lambda_w,
+        "lambda_reg": net.optimizer.lambda_reg,
+        "gamma_d": net.lif.gamma_d,
+        "time step (dt)": net.lif.dt,
+        "t_delay": net.optimizer.t_delay,
+        "f_star": net.optimizer.f_star,
+        "A": A,
+        "T": T,
+        "phi (φ)": phi,
+        "c": c,
+        "N_LIF": net.n_lif,
+        "N_ALIF": net.n_alif,
+        "sparsity": 1.0 - net.density, # densityからsparsityへ変換
+        "tau_s": net.tau_s,
+        "sigma_s": net.sigma_s,
+        "mu_s": net.mu_s,
+        "g": net.g,
+        "v_th": net.lif.v_th,
+        "I_bias": net.I_bias,
+        "tau_mem": net.lif.tau_mem,
+        "tau_alif": net.alif.tau_alif,
+        "tau_r": net.lif.tau_r,
+        "tau_d": net.lif.tau_d,
+        "t_ref": net.lif.t_ref
+    }
+
+    with open(param_filename, "w", encoding="utf-8") as f:
+        f.write("スクリプト内で使用されたハイパーパラメータ一覧\n")
+        f.write("=" * 60 + "\n")
+        for key, value in actual_params.items():
+            f.write(f"{key}: {value}\n")
+            
+    print(f"スクリプトで使用されたパラメータ数値をテキストファイル '{param_filename}' として保存しました。")
