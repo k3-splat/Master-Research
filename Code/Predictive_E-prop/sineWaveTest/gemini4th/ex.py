@@ -252,9 +252,9 @@ class PredictiveEPropNet:
         self.s = np.zeros(self.n_neurons)
 
     def generate_ou_noise(self, dt=1.0):
-        # Section 2.1: Ornstein-Uhlenbeck noise s
+        # Section 2.1: Ornstein-Uhlenbeck noise s (修正: 拡散項に dt / tau_s のスケーリングを適用)
         decay = np.exp(-dt / self.tau_s)
-        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
+        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0):
