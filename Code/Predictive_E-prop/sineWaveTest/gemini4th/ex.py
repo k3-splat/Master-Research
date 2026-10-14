@@ -24,7 +24,7 @@ class BaseNeuronGroup:
         self.decay_r = np.exp(-dt / tau_r)
         self.decay_d = np.exp(-dt / tau_d)
         
-        # Eq. 2 & Eq. 5: c_rd = 1 / (tau_r * tau_d)
+        # Eq. 2: c_rd = 1 / (tau_r * tau_d)
         self.c_rd = 1.0 / (tau_r * tau_d)
         
         self.reset_state()
@@ -142,7 +142,7 @@ class EPropOptimizer:
         self.e_trace_sum.fill(0)
         self.step_counter = 0
 
-    def update_traces_and_gradients(self, neurons, z_bar_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
+    def update_traces_and_gradients(self, neurons, z_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
         for idx, neuron_group in enumerate(neurons):
             offset = 0 if idx == 0 else neurons[0].n
             n_g = neuron_group.n
@@ -163,8 +163,8 @@ class EPropOptimizer:
         # 毎ステップの勾配を蓄積
         # Eq. 3: Delta W_ij^rec = eta * sum_t ( L_i^t * e_ij^t )
         self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
-        # Eq. 11 (修正): 出力 y_i^t = sum W_ij^out * z_bar_bar_j^t に対する厳密な偏微分として z_bar_bar_curr を使用
-        self.grad_w_out_accumulated += np.outer(error_t, z_bar_bar_curr)
+        # Eq. 11: Delta W_ij^out = eta * sum_t ( (y_i^t - x_i^t) * z_bar_j^t )
+        self.grad_w_out_accumulated += np.outer(error_t, z_bar_curr)
         
         all_spikes = np.concatenate([g.z for g in neurons])
         self.spike_buffer += all_spikes
@@ -303,14 +303,14 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                # Eq. 5: 学習信号 L_i^t = sum_j B_ij * (y_j^t - x_j^t) * (1 / (tau_r * tau_d))
-                L_t = (self.B @ d_t) * self.lif.c_rd
+                # 修正1: 二重指数フィルタの積分ゲインはすでにトレース側(z_bar)に含まれているため c_rd を掛けない
+                L_t = self.B @ d_t
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
-                # 出力層勾配用に all_z_bar_bar を渡し、トレース計算用には過去の低周波フィルタ z_bar_prev, z_bar_prev_prev を渡す
+                # 修正2: Eq. 11の通り出力層勾配にも all_z_bar を渡す
                 should_update = self.optimizer.update_traces_and_gradients(
-                    self.neurons, all_z_bar_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
+                    self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
                 if should_update:
