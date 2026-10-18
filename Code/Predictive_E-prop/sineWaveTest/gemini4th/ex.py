@@ -233,8 +233,8 @@ class PredictiveEPropNet:
         
         # Section 2.1: W^out ~ N(0, 1) / sqrt(N_rec)
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
-        # Eq. 5: Broadcast alignment matrix B
-        self.B = np.random.randn(self.n_neurons, n_outputs)
+        # Eq. 5 (修正: 方法1b): 誤差入力重み W^in の駆動方向と矛盾しないように固定行列 B を整合させる
+        self.B = -self.w_in * np.sqrt(g)
         
         # パラメータ出力用に保持
         self.I_bias = 0.02
@@ -354,7 +354,7 @@ if __name__ == "__main__":
     for epoch in range(epochs):
         print(f"--- Epoch {epoch+1}/{epochs} ---")
         
-        out_all = net.run_full_epoch(target_all)
+        out_all = net.run_full_epoch(target_signal=target_all)
         
         # Eq. 4: 評価用平均二乗誤差 (Loss = mean((y - x)^2))
         loss_train = np.mean((out_all[:len_train] - target_all[:len_train])**2)
