@@ -107,12 +107,11 @@ class ALIFGroup(BaseNeuronGroup):
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 # ==========================================
-# 最適化手法 (Predictive E-prop)
+# 最適化手法 (Predictive E-prop with Adam)
 # ==========================================
 class EPropOptimizer:
     def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
-        # パラメータ出力用に保持
         self.eta = eta
         self.lambda_reg = lambda_reg
         self.lambda_w = lambda_w
@@ -130,6 +129,17 @@ class EPropOptimizer:
         self.spike_buffer = np.zeros(n_neurons)
         self.e_trace_sum = np.zeros((n_neurons, n_neurons))
         self.step_counter = 0
+
+        # Adam オプティマイザのパラメータ
+        self.beta1 = 0.9
+        self.beta2 = 0.999
+        self.epsilon = 1e-8
+        self.adam_t = 0
+        
+        self.m_w_rec = np.zeros((n_neurons, n_neurons))
+        self.v_w_rec = np.zeros((n_neurons, n_neurons))
+        self.m_w_out = np.zeros((n_outputs, n_neurons))
+        self.v_w_out = np.zeros((n_outputs, n_neurons))
 
     def reset_traces(self):
         self.e_trace.fill(0)
@@ -163,7 +173,7 @@ class EPropOptimizer:
         # 毎ステップの勾配を蓄積
         # Eq. 3: Delta W_ij^rec = eta * sum_t ( L_i^t * e_ij^t )
         self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
-        # Eq. 11: 出力層の重み更新に z_bar_curr を使用
+        # Eq. 11: 出力 y_i^t = sum W_ij^out * z_bar_bar_j^t (更新には z_bar_curr を使用)
         self.grad_w_out_accumulated += np.outer(error_t, z_bar_curr)
         
         all_spikes = np.concatenate([g.z for g in neurons])
@@ -193,9 +203,25 @@ class EPropOptimizer:
         return False
 
     def apply_weight_update(self, w_rec, w_out):
-        # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
-        w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
+        self.adam_t += 1
+        
+        # 損失関数の勾配 (正則化項を含む L2 Weight Decay)
+        g_w_rec = self.grad_w_rec + 2 * self.lambda_w * w_rec
+        g_w_out = self.grad_w_out + 2 * self.lambda_w * w_out
+        
+        # Adam: w_rec の更新
+        self.m_w_rec = self.beta1 * self.m_w_rec + (1 - self.beta1) * g_w_rec
+        self.v_w_rec = self.beta2 * self.v_w_rec + (1 - self.beta2) * (g_w_rec ** 2)
+        m_hat_rec = self.m_w_rec / (1 - self.beta1 ** self.adam_t)
+        v_hat_rec = self.v_w_rec / (1 - self.beta2 ** self.adam_t)
+        w_rec -= self.eta * m_hat_rec / (np.sqrt(v_hat_rec) + self.epsilon)
+
+        # Adam: w_out の更新
+        self.m_w_out = self.beta1 * self.m_w_out + (1 - self.beta1) * g_w_out
+        self.v_w_out = self.beta2 * self.v_w_out + (1 - self.beta2) * (g_w_out ** 2)
+        m_hat_out = self.m_w_out / (1 - self.beta1 ** self.adam_t)
+        v_hat_out = self.v_w_out / (1 - self.beta2 ** self.adam_t)
+        w_out -= self.eta * m_hat_out / (np.sqrt(v_hat_out) + self.epsilon)
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
@@ -233,7 +259,7 @@ class PredictiveEPropNet:
         
         # Section 2.1: W^out ~ N(0, 1) / sqrt(N_rec)
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
-        # Eq. 5 (修正: 方法1b): 誤差入力重み W^in の駆動方向と矛盾しないように固定行列 B を整合させる
+        # Eq. 5: 誤差入力重み W^in の駆動方向と矛盾しないように固定行列 B を整合させる
         self.B = -self.w_in * np.sqrt(g)
         
         # パラメータ出力用に保持
@@ -252,7 +278,7 @@ class PredictiveEPropNet:
         self.s = np.zeros(self.n_neurons)
 
     def generate_ou_noise(self, dt=1.0):
-        # Section 2.1: Ornstein-Uhlenbeck noise s (修正: 拡散項に dt / tau_s のスケーリングを適用)
+        # Section 2.1: Ornstein-Uhlenbeck noise s (拡散項に dt / tau_s のスケーリングを適用)
         decay = np.exp(-dt / self.tau_s)
         self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
         return self.s
