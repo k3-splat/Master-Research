@@ -172,7 +172,8 @@ class EPropOptimizer:
         
         # 毎ステップの勾配を蓄積
         # Eq. 3: Delta W_ij^rec = eta * sum_t ( L_i^t * e_ij^t )
-        self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
+        # 【修正】 L_tは誤差を減らす方向(-∇E)を向いているため、勾配(∇E)として蓄積するには減算する
+        self.grad_w_rec_accumulated -= L_t[:, None] * self.e_trace
         # Eq. 11: 出力 y_i^t = sum W_ij^out * z_bar_bar_j^t (更新には z_bar_curr を使用)
         self.grad_w_out_accumulated += np.outer(error_t, z_bar_bar_curr)
         

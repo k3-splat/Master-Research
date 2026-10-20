@@ -194,7 +194,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
+        # w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
@@ -252,20 +252,13 @@ class PredictiveEPropNet:
         self.s = np.zeros(self.n_neurons)
 
     def generate_ou_noise(self, dt=1.0):
-        # Section 2.1: Ornstein-Uhlenbeck noise s
+        # Section 2.1: Ornstein-Uhlenbeck noise s (拡散項に dt / tau_s のスケーリングを適用)
         decay = np.exp(-dt / self.tau_s)
-        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
+        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0):
         self.reset_state()
-        
-        # 【変更箇所】各エポックごとにマスクw_rec_maskをリセット（再生成）
-        self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
-        np.fill_diagonal(self.w_rec_mask, 0.0)
-        # 再生成したマスクを現在のw_recに適用
-        self.w_rec *= self.w_rec_mask
-        
         timesteps = len(target_signal)
         outputs = np.zeros((timesteps, self.n_outputs))
         
