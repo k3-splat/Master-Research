@@ -152,7 +152,7 @@ class EPropOptimizer:
         self.e_trace_sum.fill(0)
         self.step_counter = 0
 
-    def update_traces_and_gradients(self, neurons, z_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
+    def update_traces_and_gradients(self, neurons, z_bar_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
         for idx, neuron_group in enumerate(neurons):
             offset = 0 if idx == 0 else neurons[0].n
             n_g = neuron_group.n
@@ -174,7 +174,7 @@ class EPropOptimizer:
         # Eq. 3: Delta W_ij^rec = eta * sum_t ( L_i^t * e_ij^t )
         self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
         # Eq. 11: 出力 y_i^t = sum W_ij^out * z_bar_bar_j^t (更新には z_bar_curr を使用)
-        self.grad_w_out_accumulated += np.outer(error_t, z_bar_curr)
+        self.grad_w_out_accumulated += np.outer(error_t, z_bar_bar_curr)
         
         all_spikes = np.concatenate([g.z for g in neurons])
         self.spike_buffer += all_spikes
@@ -196,8 +196,8 @@ class EPropOptimizer:
             # バッファクリア
             self.spike_buffer.fill(0)
             self.e_trace_sum.fill(0)
-            self.grad_w_rec_accumulated.fill(0)
-            self.grad_w_out_accumulated.fill(0)
+            # self.grad_w_rec_accumulated.fill(0)
+            # self.grad_w_out_accumulated.fill(0)
             self.step_counter = 0
             return True
         return False
@@ -330,7 +330,7 @@ class PredictiveEPropNet:
             
             if phase == "training":
                 # 二重指数フィルタの積分ゲインはすでにトレース側(z_bar)に含まれているため c_rd を掛けない
-                L_t = self.B @ d_t
+                L_t = self.B @ d_t * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
