@@ -142,7 +142,6 @@ class EPropOptimizer:
         
         self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
         
-        # 修正箇所: 数学的整合性を持たせるため W_out の勾配計算に二重指数フィルタ (z_bar_bar) を使用
         self.grad_w_out_accumulated += np.outer(error_t, z_bar_bar_curr)
         
         all_spikes = np.concatenate([g.z for g in neurons])
@@ -197,7 +196,6 @@ class PredictiveEPropNet:
         self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
-        # 修正箇所: スパース結合であっても論文通り 1/sqrt(N_rec) でスケールする
         self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
 
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
@@ -224,7 +222,8 @@ class PredictiveEPropNet:
 
     def generate_ou_noise(self, dt=1.0):
         decay = np.exp(-dt / self.tau_s)
-        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
+        # 修正箇所: 論文実装の意図に合わせ、(dt/tau_s)のスケーリングによるアッテネーションを復活
+        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0, record=False):
@@ -278,7 +277,6 @@ class PredictiveEPropNet:
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
-                # 修正箇所: 勾配計算用に z_bar_bar_curr (all_z_bar_bar) を渡す
                 should_update = self.optimizer.update_traces_and_gradients(
                     self.neurons, all_z_bar_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
