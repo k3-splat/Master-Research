@@ -197,7 +197,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        w_rec -= 100 * self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
+        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
@@ -321,7 +321,7 @@ class PredictiveEPropNet:
             
             if phase == "training":
                 # Eq. 5 & Eq. S3: 学習信号 L_i^t とホメオスタシス正則化項の統合
-                L_t = (self.B @ d_t) * self.lif.c_rd
+                L_t = (self.B @ d_t) # * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
