@@ -110,10 +110,11 @@ class ALIFGroup(BaseNeuronGroup):
 # 最適化手法 (Predictive E-prop)
 # ==========================================
 class EPropOptimizer:
-    def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
+    def __init__(self, n_neurons, n_inputs, n_outputs, eta_rec=0.4, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
         # パラメータ出力用に保持
-        self.eta = eta
+        self.eta_rec = eta_rec
+        self.eta_out = eta_out
         self.lambda_reg = lambda_reg
         self.lambda_w = lambda_w
         self.t_delay = t_delay
@@ -197,8 +198,8 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
-        w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
+        w_rec -= self.eta_rec * self.grad_w_rec + self.eta_rec * (2 * self.lambda_w) * w_rec
+        w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
@@ -248,7 +249,7 @@ class PredictiveEPropNet:
         self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
         # self.s = 0.0
         
-        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.1) 
+        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs) 
 
         # --- 分析用データの保存 ---
         self.rec_z = None
@@ -320,14 +321,14 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                # Eq. 5 & Eq. S3: 学習信号 L_i^t とホメオスタシス正則化項の統合
+                # Eq. 5 & Eq. S3: 学習信号 L_i^t
                 L_t = (self.B @ d_t) * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
                 # 出力層勾配用に all_z_bar_bar を渡し、トレース計算用には低周波フィルタ all_z_bar を渡す
                 should_update = self.optimizer.update_traces_and_gradients(
-                    self.neurons, all_z_bar_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
+                    self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
                 if record:
@@ -459,7 +460,8 @@ if __name__ == "__main__":
         "training phase (ms)": len_train,
         "error-driven phase (ms)": len_error,
         "free-running phase (ms)": len_free,
-        "eta (η)": net.optimizer.eta,
+        "eta_rec": net.optimizer.eta_rec,
+        "eta_out" : net.optimizer.eta_out,
         "lambda_W": net.optimizer.lambda_w,
         "lambda_reg": net.optimizer.lambda_reg,
         "gamma_d": net.lif.gamma_d,
