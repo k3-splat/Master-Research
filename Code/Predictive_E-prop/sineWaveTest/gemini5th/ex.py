@@ -248,7 +248,7 @@ class PredictiveEPropNet:
         self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
         # self.s = 0.0
         
-        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
+        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.1) 
 
         # --- 分析用データの保存 ---
         self.rec_z = None
@@ -321,7 +321,7 @@ class PredictiveEPropNet:
             
             if phase == "training":
                 # Eq. 5 & Eq. S3: 学習信号 L_i^t とホメオスタシス正則化項の統合
-                L_t = (self.B @ d_t) # * self.lif.c_rd
+                L_t = (self.B @ d_t) * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
