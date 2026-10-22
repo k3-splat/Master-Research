@@ -55,7 +55,7 @@ class BaseNeuronGroup:
         v_next = v_next_raw - self.z * b_next
         
         # Section 2.1: 不応期の適用 (5 ms)
-        v_next[is_currently_refractory] = self.v[is_currently_refractory]
+        v_next[is_currently_refractory] = self.v[is_currently_refractory] # 不応期中のニューロンの膜電位を固定
         
         self.ref_counts = np.maximum(0, self.ref_counts - self.dt)
         self.ref_counts[self.z > 0] = self.t_ref
@@ -330,7 +330,6 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                # 二重指数フィルタの積分ゲインはすでにトレース側(z_bar)に含まれているため c_rd を掛けない
                 L_t = self.B @ d_t * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])

@@ -44,7 +44,7 @@ class BaseNeuronGroup:
         # Eq. 7: テンソル微分の近似 (Tent surrogate gradient)
         self.psi = (self.gamma_d / self.v_th) * np.maximum(0, 1.0 - np.abs((v_next_raw - b_next) / self.v_th))
         
-        # 【追加】不応期中の擬似微分を0にマスクする（幻の勾配を防ぐ）
+        # 不応期中の擬似微分を0にマスクする（幻の勾配を防ぐ）
         is_currently_refractory = self.ref_counts > 0
         self.psi[is_currently_refractory] = 0.0
         
@@ -130,6 +130,8 @@ class EPropOptimizer:
         self.spike_buffer = np.zeros(n_neurons)
         self.e_trace_sum = np.zeros((n_neurons, n_neurons))
         self.step_counter = 0
+        # 直近の t_delay 間の平均発火率を保持する変数を追加
+        self.f_bar = np.zeros(n_neurons)
 
     def reset_traces(self):
         self.e_trace.fill(0)
@@ -141,6 +143,7 @@ class EPropOptimizer:
         self.spike_buffer.fill(0)
         self.e_trace_sum.fill(0)
         self.step_counter = 0
+        self.f_bar.fill(0)
 
     def update_traces_and_gradients(self, neurons, z_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
         for idx, neuron_group in enumerate(neurons):
@@ -226,7 +229,7 @@ class PredictiveEPropNet:
         self.density = 0.01
         self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
         
-        # 【追加】自己結合（対角成分）を無効化
+        # 自己結合（対角成分）を無効化
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
         self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
@@ -303,8 +306,8 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                # Eq. 5: 学習信号 L_i^t = sum_j B_ij * (y_j^t - x_j^t) * (1 / (tau_r * tau_d))
-                L_t = (self.B @ d_t) * self.lif.c_rd + self.optimizer.lambda_reg * (self.optimizer.spike_buffer - self.optimizer.f_star) / self.optimizer.t_delay
+                # Eq. 5 & Eq. S3: 学習信号 L_i^t とホメオスタシス正則化項の統合
+                L_t = (self.B @ d_t) * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
