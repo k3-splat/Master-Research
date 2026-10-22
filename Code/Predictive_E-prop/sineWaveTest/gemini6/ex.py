@@ -196,7 +196,7 @@ class PredictiveEPropNet:
         self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
-        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
+        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
 
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
         self.B = np.random.randn(self.n_neurons, n_outputs)
@@ -222,7 +222,6 @@ class PredictiveEPropNet:
 
     def generate_ou_noise(self, dt=1.0):
         decay = np.exp(-dt / self.tau_s)
-        # 修正箇所: 論文実装の意図に合わせ、(dt/tau_s)のスケーリングによるアッテネーションを復活
         self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
         return self.s
 
@@ -285,7 +284,8 @@ class PredictiveEPropNet:
                     self.rec_z[t] = np.concatenate([self.lif.z, self.alif.z]) > 0
                     self.rec_L[t] = L_t[0].copy()
                     self.rec_e[t] = np.mean(np.abs(self.optimizer.e_trace))
-                    self.rec_f[t] = np.mean(self.optimizer.spike_buffer / self.optimizer.t_delay) * 1000
+                    # 修正箇所: 瞬時発火率の計算に統一
+                    self.rec_f[t] = np.mean(np.concatenate([self.lif.z, self.alif.z])) * 1000
                 
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
@@ -303,6 +303,7 @@ class PredictiveEPropNet:
                     if self.optimizer.step_counter >= self.optimizer.t_delay:
                         self.optimizer.spike_buffer.fill(0)
                         self.optimizer.step_counter = 0
+                    # 修正箇所: 瞬時発火率の計算
                     self.rec_f[t] = np.mean(current_spikes) * 1000 
             
         return outputs
@@ -364,8 +365,11 @@ if __name__ == "__main__":
             axes_analysis[2].set_title("Eligibility Trace e (Mean Absolute Value)")
             axes_analysis[2].set_ylabel("e")
             
-            axes_analysis[3].plot(t_all, net.rec_f, color='green')
-            axes_analysis[3].set_title("Mean Firing Rate")
+            # 修正箇所: 100msの移動平均を適用してプロット
+            window = 100
+            smoothed_f = np.convolve(net.rec_f, np.ones(window)/window, mode='same')
+            axes_analysis[3].plot(t_all, smoothed_f, color='green')
+            axes_analysis[3].set_title("Mean Firing Rate (100ms Moving Average)")
             axes_analysis[3].set_xlabel("Time [ms]")
             axes_analysis[3].set_ylabel("Hz")
             
