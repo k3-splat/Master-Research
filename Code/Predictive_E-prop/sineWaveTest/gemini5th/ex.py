@@ -46,7 +46,7 @@ class BaseNeuronGroup:
         
         # 不応期中の擬似微分を0にマスクする（幻の勾配を防ぐ）
         is_currently_refractory = self.ref_counts > 0
-        self.psi[is_currently_refractory] = 0.0
+        # self.psi[is_currently_refractory] = 0.0
         
         # Eq. 1: z_i^t = theta(v_i^t - b_i^t) (不応期考慮)
         self.z = np.where((v_next_raw > b_next) & (~is_currently_refractory), 1.0, 0.0)
@@ -197,7 +197,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
+        # w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
@@ -313,7 +313,7 @@ class PredictiveEPropNet:
                 
                 # 出力層勾配用に all_z_bar_bar を渡し、トレース計算用には低周波フィルタ all_z_bar を渡す
                 should_update = self.optimizer.update_traces_and_gradients(
-                    self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
+                    self.neurons, all_z_bar_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
                 if should_update:
