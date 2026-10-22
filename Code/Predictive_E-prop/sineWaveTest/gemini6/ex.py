@@ -278,7 +278,7 @@ class PredictiveEPropNet:
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
                 should_update = self.optimizer.update_traces_and_gradients(
-                    self.neurons, all_z_bar_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
+                    self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
                 if record:
