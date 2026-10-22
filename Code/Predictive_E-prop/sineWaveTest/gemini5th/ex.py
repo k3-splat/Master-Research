@@ -328,7 +328,7 @@ class PredictiveEPropNet:
                 
                 # 出力層勾配用に all_z_bar_bar を渡し、トレース計算用には低周波フィルタ all_z_bar を渡す
                 should_update = self.optimizer.update_traces_and_gradients(
-                    self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
+                    self.neurons, all_z_bar_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
                 if record:
