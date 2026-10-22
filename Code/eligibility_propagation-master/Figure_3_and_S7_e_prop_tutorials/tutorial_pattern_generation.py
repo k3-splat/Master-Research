@@ -2,6 +2,8 @@
 # Full paper: A solution to the learning dilemma for recurrent networks of spiking neurons
 # Authors: G Bellec*, F Scherr*, A Subramoney, E Hajek, Darjan Salaj, R Legenstein, W Maass
 
+import matplotlib
+matplotlib.use('Agg')  # CLI環境（ディスプレイなし）でも画像保存を可能にする
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.random as rd
@@ -159,18 +161,14 @@ with tf.name_scope("Optimization"):
 sess = tf.Session()
 sess.run(tf.global_variables_initializer())
 
-# Open an interactive matplotlib window to plot in real time
+# フィギュアの作成
 if FLAGS.do_plot:
-    plt.ion()
     fig, ax_list = plt.subplots(2 + FLAGS.n_out + 4, figsize=(8, 12), sharex=True)
 
-def update_plot(plot_result_values, batch=0, n_max_neuron_per_raster=40):
+def update_plot(plot_result_values, batch=0, n_max_neuron_per_raster=40, save_path="pattern_generation_snapshot.png"):
     """
-    This function iterates the matplotlib figure on every call.
-    It plots the data for a fixed sequence that should be representative of the expected computation
-    :return:
+    This function generates the matplotlib figure and saves it to a file.
     """
-
     # Clear the axis to print new plots
     for k in range(ax_list.shape[0]):
         ax = ax_list[k]
@@ -191,12 +189,11 @@ def update_plot(plot_result_values, batch=0, n_max_neuron_per_raster=40):
     for i in range(output.shape[1]):
         ax = ax_list[i + 2]
         ax.set_yticks([-1, 0, 1])
-        # ax.set_ylim([-1., 1.])
         ax.set_ylabel('Output')
 
         ax.plot(np.arange(FLAGS.seq_len), target_sinusoidal_outputs[batch, :, i], linestyle='dashed', label='Target',
                 alpha=0.8)
-        ax.plot(np.arange(FLAGS.seq_len), output[:, i], linestyle='solid', label='Target', alpha=0.8)
+        ax.plot(np.arange(FLAGS.seq_len), output[:, i], linestyle='solid', label='Prediction', alpha=0.8)
 
         ax.set_xlim([0, FLAGS.seq_len])
 
@@ -206,10 +203,10 @@ def update_plot(plot_result_values, batch=0, n_max_neuron_per_raster=40):
         # choose i and j to find an interesting synapse representative of what is happening
         i_pre = np.random.randint(FLAGS.n_rec)
         j_post = np.random.randint(FLAGS.n_rec)
-        el_data_list = [results_values['pre_term'][batch, :, i_pre],
-                        results_values['post_term'][batch, :, j_post],
-                        results_values['eligibility_traces'][batch, :, i_pre, j_post],
-                        results_values['learning_signals'][batch, :, j_post],
+        el_data_list = [plot_result_values['pre_term'][batch, :, i_pre],
+                        plot_result_values['post_term'][batch, :, j_post],
+                        plot_result_values['eligibility_traces'][batch, :, i_pre, j_post],
+                        plot_result_values['learning_signals'][batch, :, j_post],
                         ]
 
     name_list = ['term pre',
@@ -229,10 +226,8 @@ def update_plot(plot_result_values, batch=0, n_max_neuron_per_raster=40):
     ax_list[2 + FLAGS.n_out + 3].set_ylim([-0.08, 0.08])
 
     ax.set_xlabel('Time in ms')
-    # To plot with interactive python one need to wait one second to the time to draw the axis
-    if FLAGS.do_plot:
-        plt.draw()
-        plt.pause(0.1)
+    plt.tight_layout()
+    fig.savefig(save_path)
 
 
 # Loss list to store the loss over itertaions
@@ -254,7 +249,6 @@ results_tensors = {
     'learning_signals': learning_signals,
 
     'output': output,
-
 }
 
 t_train = 0
@@ -286,7 +280,6 @@ for k_iter in range(FLAGS.n_iter):
                                                                      results_values['loss_reg']))
         loss_list.append(results_values['loss'])
 
-
         def get_stats(v):
             if np.size(v) == 0:
                 return np.nan, np.nan, np.nan, np.nan
@@ -298,7 +291,6 @@ for k_iter in range(FLAGS.n_iter):
 
             return np.min(v), np.max(v), np.mean(v), np.std(v), k_min, k_max
 
-
         firing_rate_stats = get_stats(results_values['av'] * 1000)
 
         print('''
@@ -309,14 +301,16 @@ for k_iter in range(FLAGS.n_iter):
         ))
 
         if FLAGS.do_plot:
-            update_plot(results_values)
+            update_plot(results_values, save_path="pattern_generation_snapshot.png")
 
-plt.ioff()
-update_plot(results_values)
+if FLAGS.do_plot:
+    update_plot(results_values, save_path="pattern_generation_final.png")
+    print("Saved final snapshot to pattern_generation_final.png")
 
-fig, ax_res = plt.subplots()
+fig_res, ax_res = plt.subplots()
 ax_res.plot(loss_list)
 ax_res.set_xlabel('iterations')
 ax_res.set_ylabel('mean square error')
-
-plt.show()
+plt.tight_layout()
+fig_res.savefig("pattern_generation_loss.png")
+print("Saved loss curve to pattern_generation_loss.png")

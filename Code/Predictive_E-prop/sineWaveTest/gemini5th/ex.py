@@ -184,7 +184,7 @@ class EPropOptimizer:
             f_bar = self.spike_buffer / self.t_delay
             # d(E_reg)/dW_ij^rec = (lambda_reg / t_delay) * (f_bar_i - f^*) * sum e_ij
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
-            # self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
+            self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
             
             # バッファクリア
             self.spike_buffer.fill(0)
@@ -250,6 +250,11 @@ class PredictiveEPropNet:
         
         self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
 
+        # --- 分析用データの保存 ---
+        self.rec_z = None
+        self.rec_L = None
+        self.rec_e = None
+
     def reset_state(self):
         self.lif.reset_state()
         self.alif.reset_state()
@@ -264,7 +269,7 @@ class PredictiveEPropNet:
         # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s
 
-    def run_full_epoch(self, target_signal, dt=1.0):
+    def run_full_epoch(self, target_signal, dt=1.0, record=False):
         self.reset_state()
         timesteps = len(target_signal)
         outputs = np.zeros((timesteps, self.n_outputs))
@@ -273,6 +278,11 @@ class PredictiveEPropNet:
         z_bar_prev_prev = np.zeros(self.n_neurons)
         psi_prev = np.zeros(self.n_neurons)
         
+        if record:
+            self.rec_z = np.zeros((timesteps, self.n_neurons), dtype=bool)
+            self.rec_L = np.zeros(timesteps)
+            self.rec_e = np.zeros(timesteps)
+            
         for t in range(timesteps):
             # Section 2.3 & Figure 1B: 実験フェーズ制御
             if t < 10000:
@@ -304,7 +314,7 @@ class PredictiveEPropNet:
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
             
-            total_current = xi * i_in + i_rec + i_fb + self.I_bias # + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.I_bias + s_t
             
             self.lif.step(total_current[:self.n_lif])
             self.alif.step(total_current[self.n_lif:])
@@ -320,6 +330,11 @@ class PredictiveEPropNet:
                     self.neurons, all_z_bar_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
+                if record:
+                    self.rec_z[t] = np.concatenate([self.lif.z, self.alif.z]) > 0
+                    self.rec_L[t] = L_t[0].copy()
+                    self.rec_e[t] = np.mean(np.abs(self.optimizer.e_trace))
+                
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
                     # スパース結合構造と対角成分0の維持
@@ -328,6 +343,10 @@ class PredictiveEPropNet:
                 z_bar_prev_prev = z_bar_prev.copy()
                 z_bar_prev = all_z_bar.copy()
                 psi_prev = all_psi.copy()
+            else:
+                if record:
+                    self.rec_z[t] = np.concatenate([self.lif.z, self.alif.z]) > 0
+                    # L_t, e_trace は training 以降は計算されないため 0 のままにする
             
         return outputs
 
@@ -358,10 +377,15 @@ if __name__ == "__main__":
     epochs = 50
     out_all = None
     
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs("output", exist_ok=True)
+    
     for epoch in range(epochs):
         print(f"--- Epoch {epoch+1}/{epochs} ---")
         
-        out_all = net.run_full_epoch(target_all)
+        # 10エポックごとに記録をオンにする
+        do_record = (epoch + 1) % 10 == 0
+        out_all = net.run_full_epoch(target_all, record=do_record)
         
         # Eq. 4: 評価用平均二乗誤差 (Loss = mean((y - x)^2))
         loss_train = np.mean((out_all[:len_train] - target_all[:len_train])**2)
@@ -371,13 +395,35 @@ if __name__ == "__main__":
         print(f"  Training Loss: {loss_train:.5f}")
         print(f"  Error-driven Loss: {loss_error:.5f}")
         print(f"  Free-running Loss: {loss_free:.5f}")
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if do_record:
+            fig_analysis, axes_analysis = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+            
+            # スパイク (z) のラスタープロット
+            spikes = net.rec_z
+            y_idx, x_idx = np.where(spikes.T)
+            axes_analysis[0].scatter(x_idx, y_idx, s=1, color='black', alpha=0.5)
+            axes_analysis[0].set_title(f"Spikes z (Epoch {epoch+1})")
+            axes_analysis[0].set_ylabel("Neuron index")
+            
+            # 学習シグナル (L)
+            axes_analysis[1].plot(t_all, net.rec_L, color='blue')
+            axes_analysis[1].set_title("Learning Signal L (Neuron 0)")
+            axes_analysis[1].set_ylabel("L")
+            
+            # 適格性トレース (e)
+            axes_analysis[2].plot(t_all, net.rec_e, color='red')
+            axes_analysis[2].set_title("Eligibility Trace e (Mean Absolute Value)")
+            axes_analysis[2].set_xlabel("Time [ms]")
+            axes_analysis[2].set_ylabel("e")
+            
+            plt.tight_layout()
+            analysis_filename = f"output/analysis_epoch_{epoch+1}_{timestamp}.png"
+            plt.savefig(analysis_filename)
+            plt.close(fig_analysis)
+            print(f"  => 内部状態のプロットを '{analysis_filename}' に保存しました。")
     
-    # 出力先ディレクトリの確保
-    os.makedirs("output", exist_ok=True)
-    
-    # --- 画像ファイルの出力 ---
+    # --- 全体の推論結果画像ファイルの出力 ---
     img_filename = f"output/predictive_eprop_result_{timestamp}.png"
     
     fig, axes = plt.subplots(3, 1, figsize=(10, 8))
@@ -403,7 +449,7 @@ if __name__ == "__main__":
     
     plt.tight_layout()
     plt.savefig(img_filename)
-    print(f"\nプロットを画像ファイル '{img_filename}' として保存しました。")
+    print(f"\n推論結果のプロットを画像ファイル '{img_filename}' として保存しました。")
     
     # --- スクリプトで使用されたパラメータのファイル出力 ---
     param_filename = f"output/predictive_eprop_params_{timestamp}.txt"
