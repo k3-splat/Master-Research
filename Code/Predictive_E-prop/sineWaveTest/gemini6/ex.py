@@ -124,7 +124,7 @@ class EPropOptimizer:
         self.step_counter = 0
         self.f_bar.fill(0)
 
-    def update_traces_and_gradients(self, neurons, z_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
+    def update_traces_and_gradients(self, neurons, z_bar_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
         for idx, neuron_group in enumerate(neurons):
             offset = 0 if idx == 0 else neurons[0].n
             n_g = neuron_group.n
@@ -141,7 +141,9 @@ class EPropOptimizer:
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
         
         self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
-        self.grad_w_out_accumulated += np.outer(error_t, z_bar_curr)
+        
+        # 修正箇所: 数学的整合性を持たせるため W_out の勾配計算に二重指数フィルタ (z_bar_bar) を使用
+        self.grad_w_out_accumulated += np.outer(error_t, z_bar_bar_curr)
         
         all_spikes = np.concatenate([g.z for g in neurons])
         self.spike_buffer += all_spikes
@@ -195,8 +197,8 @@ class PredictiveEPropNet:
         self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
-        # 修正箇所: スパース結合のスケーリング補正
-        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
+        # 修正箇所: スパース結合であっても論文通り 1/sqrt(N_rec) でスケールする
+        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
 
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
         self.B = np.random.randn(self.n_neurons, n_outputs)
@@ -212,7 +214,7 @@ class PredictiveEPropNet:
         self.rec_z = None
         self.rec_L = None
         self.rec_e = None
-        self.rec_f = None # 発火率記録用
+        self.rec_f = None 
 
     def reset_state(self):
         self.lif.reset_state()
@@ -222,7 +224,6 @@ class PredictiveEPropNet:
 
     def generate_ou_noise(self, dt=1.0):
         decay = np.exp(-dt / self.tau_s)
-        # 修正箇所: Ornstein-Uhlenbeckノイズの適切な離散化係数
         self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s
 
@@ -239,7 +240,7 @@ class PredictiveEPropNet:
             self.rec_z = np.zeros((timesteps, self.n_neurons), dtype=bool)
             self.rec_L = np.zeros(timesteps)
             self.rec_e = np.zeros(timesteps)
-            self.rec_f = np.zeros(timesteps) # 発火率記録領域の初期化
+            self.rec_f = np.zeros(timesteps) 
             
         for t in range(timesteps):
             if t < 10000:
@@ -277,15 +278,15 @@ class PredictiveEPropNet:
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
+                # 修正箇所: 勾配計算用に z_bar_bar_curr (all_z_bar_bar) を渡す
                 should_update = self.optimizer.update_traces_and_gradients(
-                    self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
+                    self.neurons, all_z_bar_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
                 if record:
                     self.rec_z[t] = np.concatenate([self.lif.z, self.alif.z]) > 0
                     self.rec_L[t] = L_t[0].copy()
                     self.rec_e[t] = np.mean(np.abs(self.optimizer.e_trace))
-                    # Hz単位でネットワーク平均発火率を記録
                     self.rec_f[t] = np.mean(self.optimizer.spike_buffer / self.optimizer.t_delay) * 1000
                 
                 if should_update:
@@ -298,14 +299,12 @@ class PredictiveEPropNet:
             else:
                 if record:
                     self.rec_z[t] = np.concatenate([self.lif.z, self.alif.z]) > 0
-                    # t_delay期間のスライディング平均発火率を記録
                     current_spikes = np.concatenate([self.lif.z, self.alif.z])
                     self.optimizer.spike_buffer += current_spikes
                     self.optimizer.step_counter += 1
                     if self.optimizer.step_counter >= self.optimizer.t_delay:
                         self.optimizer.spike_buffer.fill(0)
                         self.optimizer.step_counter = 0
-                    # 簡易的に瞬間発火率を記録
                     self.rec_f[t] = np.mean(current_spikes) * 1000 
             
         return outputs
@@ -367,7 +366,6 @@ if __name__ == "__main__":
             axes_analysis[2].set_title("Eligibility Trace e (Mean Absolute Value)")
             axes_analysis[2].set_ylabel("e")
             
-            # 追加: 平均発火率のプロット
             axes_analysis[3].plot(t_all, net.rec_f, color='green')
             axes_analysis[3].set_title("Mean Firing Rate")
             axes_analysis[3].set_xlabel("Time [ms]")
