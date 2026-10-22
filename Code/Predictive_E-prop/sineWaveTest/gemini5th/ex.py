@@ -62,7 +62,7 @@ class BaseNeuronGroup:
         
         # Eq. 2: 2重指数関数フィルター (Double exponential filter)
         q_prev = self.q.copy()
-        self.q = self.decay_r * self.q + self.c_rd * self.z
+        self.q = self.decay_r * self.q + self.z * self.c_rd
         self.z_bar_bar = self.decay_d * self.z_bar_bar + q_prev
         
         # Section 2.2: 単一低周波フィルター (LIF trace: eps_v = z_bar_i^t = alpha * z_bar_i^{t-1} + z_bar_bar_i^t)
@@ -184,7 +184,7 @@ class EPropOptimizer:
             f_bar = self.spike_buffer / self.t_delay
             # d(E_reg)/dW_ij^rec = (lambda_reg / t_delay) * (f_bar_i - f^*) * sum e_ij
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
-            self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
+            # self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
             
             # バッファクリア
             self.spike_buffer.fill(0)
@@ -197,7 +197,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        # w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
+        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
@@ -232,8 +232,9 @@ class PredictiveEPropNet:
         # 自己結合（対角成分）を無効化
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
-        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
-        
+        # self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
+        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
+
         # Section 2.1: W^out ~ N(0, 1) / sqrt(N_rec)
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
         # Eq. 5: Broadcast alignment matrix B
@@ -245,6 +246,7 @@ class PredictiveEPropNet:
         self.sigma_s = 1.0
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
+        # self.s = 0.0
         
         self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
 
@@ -258,6 +260,8 @@ class PredictiveEPropNet:
         # Section 2.1: Ornstein-Uhlenbeck noise s (拡散項に dt / tau_s のスケーリングを適用)
         decay = np.exp(-dt / self.tau_s)
         self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
+        # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn()
+        # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0):
@@ -300,7 +304,7 @@ class PredictiveEPropNet:
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
             
-            total_current = xi * i_in + i_rec + i_fb + self.I_bias + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.I_bias # + s_t
             
             self.lif.step(total_current[:self.n_lif])
             self.alif.step(total_current[self.n_lif:])
