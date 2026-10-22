@@ -197,7 +197,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         # Eq. S2 & S3: 重み減衰 (Weight regularization: lambda_w * ||W||^2)
-        w_rec -= self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
+        w_rec -= 100 * self.eta * self.grad_w_rec + self.eta * (2 * self.lambda_w) * w_rec
         w_out -= self.eta * self.grad_w_out + self.eta * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
