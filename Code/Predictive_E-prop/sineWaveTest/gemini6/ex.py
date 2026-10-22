@@ -196,6 +196,7 @@ class PredictiveEPropNet:
         self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
+        # self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
         self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
 
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
@@ -203,7 +204,7 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.7
+        self.sigma_s = 0.5
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons)
         
