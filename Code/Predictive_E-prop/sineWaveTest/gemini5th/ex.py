@@ -110,7 +110,7 @@ class ALIFGroup(BaseNeuronGroup):
 # 最適化手法 (Predictive E-prop)
 # ==========================================
 class EPropOptimizer:
-    def __init__(self, n_neurons, n_inputs, n_outputs, eta_rec=0.4, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
+    def __init__(self, n_neurons, n_inputs, n_outputs, eta_rec=0.0004, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
         # パラメータ出力用に保持
         self.eta_rec = eta_rec
@@ -233,8 +233,8 @@ class PredictiveEPropNet:
         # 自己結合（対角成分）を無効化
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
-        # self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
-        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
+        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
+        # self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
 
         # Section 2.1: W^out ~ N(0, 1) / sqrt(N_rec)
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
