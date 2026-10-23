@@ -167,7 +167,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         w_rec -= self.eta_rec * self.grad_w_rec + self.eta_rec * (2 * self.lambda_w) * w_rec
-        w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
+        # w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
@@ -196,11 +196,11 @@ class PredictiveEPropNet:
         self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
-        # self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
-        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
+        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
+        # self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
 
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
-        self.B = np.random.randn(self.n_neurons, n_outputs)
+        self.B = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(self.n_neurons)
         
         self.I_bias = 0.02
         self.tau_s = 250.0

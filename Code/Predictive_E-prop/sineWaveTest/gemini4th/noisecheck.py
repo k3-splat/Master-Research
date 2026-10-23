@@ -19,8 +19,8 @@ class OUNoiseGenerator:
     def generate_ou_noise(self, dt=1.0):
         # 元コードの数式に忠実な実装
         decay = np.exp(-dt / self.tau_s)
-        self.s = self.mu_s + (self.s - self.mu_s) * decay + \
-                 self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
+        # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
+        # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s.copy()
 
 def main():
