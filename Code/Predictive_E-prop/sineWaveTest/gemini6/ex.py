@@ -167,7 +167,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         w_rec -= self.eta_rec * self.grad_w_rec + self.eta_rec * (2 * self.lambda_w) * w_rec
-        # w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
+        w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
