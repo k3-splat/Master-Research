@@ -90,7 +90,7 @@ class ALIFGroup(BaseNeuronGroup):
 # 最適化手法 (Predictive E-prop)
 # ==========================================
 class EPropOptimizer:
-    def __init__(self, n_neurons, n_inputs, n_outputs, eta_rec=1.0, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
+    def __init__(self, n_neurons, n_inputs, n_outputs, eta_rec=0.0004, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
         self.eta_rec = eta_rec
         self.eta_out = eta_out
@@ -109,6 +109,7 @@ class EPropOptimizer:
         
         self.spike_buffer = np.zeros(n_neurons)
         self.e_trace_sum = np.zeros((n_neurons, n_neurons))
+        self.e_trace_sum_t_delays = np.zeros((n_neurons, n_neurons))
         self.step_counter = 0
         self.f_bar = np.zeros(n_neurons)
 
@@ -121,6 +122,7 @@ class EPropOptimizer:
         self.grad_w_out_accumulated.fill(0)
         self.spike_buffer.fill(0)
         self.e_trace_sum.fill(0)
+        self.e_trace_sum_t_delays.fill(0)
         self.step_counter = 0
         self.f_bar.fill(0)
 
@@ -139,14 +141,15 @@ class EPropOptimizer:
                                                   (rho - beta * psi_prev_g) * self.eps_b[offset:offset+n_g, :]
             
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
-        
-        self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace
+
+        self.e_trace_sum += self.e_trace
+        self.e_trace_sum_t_delays += self.e_trace
+        self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace_sum
         
         self.grad_w_out_accumulated += np.outer(error_t, z_bar_bar_curr)
         
         all_spikes = np.concatenate([g.z for g in neurons])
         self.spike_buffer += all_spikes
-        self.e_trace_sum += self.e_trace
         self.step_counter += 1
         
         if self.step_counter >= self.t_delay:
@@ -155,10 +158,10 @@ class EPropOptimizer:
 
             f_bar = self.spike_buffer / self.t_delay
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
-            self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
+            self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum_t_delays
             
             self.spike_buffer.fill(0)
-            self.e_trace_sum.fill(0)
+            self.e_trace_sum_t_delays.fill(0)
             self.grad_w_rec_accumulated.fill(0)
             self.grad_w_out_accumulated.fill(0)
             self.step_counter = 0
@@ -167,7 +170,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         w_rec -= self.eta_rec * self.grad_w_rec + self.eta_rec * (2 * self.lambda_w) * w_rec
-        # w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
+        w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
@@ -204,7 +207,7 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.5
+        self.sigma_s = 1.0
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons)
         
@@ -223,7 +226,8 @@ class PredictiveEPropNet:
 
     def generate_ou_noise(self, dt=1.0):
         decay = np.exp(-dt / self.tau_s)
-        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
+        # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
+        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0, record=False):
@@ -273,7 +277,7 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                L_t = (self.B @ d_t) # * self.lif.c_rd
+                L_t = (self.B @ d_t) * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
