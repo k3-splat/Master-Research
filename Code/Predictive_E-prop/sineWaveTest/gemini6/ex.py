@@ -207,7 +207,7 @@ class PredictiveEPropNet:
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 1.0
+        self.sigma_s = 0.1
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons)
         
@@ -277,7 +277,7 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                L_t = (self.B @ d_t) * self.lif.c_rd
+                L_t = (self.B @ d_t) # * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
