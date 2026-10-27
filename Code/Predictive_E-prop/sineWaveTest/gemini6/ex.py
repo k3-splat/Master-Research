@@ -90,7 +90,7 @@ class ALIFGroup(BaseNeuronGroup):
 # 最適化手法 (Predictive E-prop)
 # ==========================================
 class EPropOptimizer:
-    def __init__(self, n_neurons, n_inputs, n_outputs, eta_rec=0.0004, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
+    def __init__(self, n_neurons, n_inputs, n_outputs, eta_rec=1.0, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
         self.eta_rec = eta_rec
         self.eta_out = eta_out
@@ -167,7 +167,7 @@ class EPropOptimizer:
 
     def apply_weight_update(self, w_rec, w_out):
         w_rec -= self.eta_rec * self.grad_w_rec + self.eta_rec * (2 * self.lambda_w) * w_rec
-        w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
+        # w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
         
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
@@ -273,7 +273,7 @@ class PredictiveEPropNet:
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                L_t = (self.B @ d_t) * self.lif.c_rd
+                L_t = (self.B @ d_t) # * self.lif.c_rd
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 

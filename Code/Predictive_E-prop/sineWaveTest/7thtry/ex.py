@@ -103,7 +103,9 @@ class EPropOptimizer:
         self.eps_b = np.zeros((n_neurons, n_neurons))
         
         self.grad_w_rec = np.zeros((n_neurons, n_neurons))
-        self.grad_w_out = np.zeros((n_outputs, n_neurons))
+        # grad_w_out はエポックの最後のみで使用するためここでの宣言は不要になりましたが、互換性のため残します
+        self.grad_w_out = np.zeros((n_outputs, n_neurons)) 
+        
         self.grad_w_rec_accumulated = np.zeros((n_neurons, n_neurons))
         self.grad_w_out_accumulated = np.zeros((n_outputs, n_neurons))
         
@@ -151,7 +153,6 @@ class EPropOptimizer:
         
         if self.step_counter >= self.t_delay:
             self.grad_w_rec = self.grad_w_rec_accumulated.copy()
-            self.grad_w_out = self.grad_w_out_accumulated.copy()
 
             f_bar = self.spike_buffer / self.t_delay
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
@@ -160,18 +161,19 @@ class EPropOptimizer:
             self.spike_buffer.fill(0)
             self.e_trace_sum.fill(0)
             self.grad_w_rec_accumulated.fill(0)
-            self.grad_w_out_accumulated.fill(0)
             self.step_counter = 0
             return True
         return False
 
-    def apply_weight_update(self, w_rec, w_out):
+    def apply_w_rec_update(self, w_rec):
         w_rec -= self.eta_rec * self.grad_w_rec + self.eta_rec * (2 * self.lambda_w) * w_rec
-        w_out -= self.eta_out * self.grad_w_out + self.eta_out * (2 * self.lambda_w) * w_out
-        
         self.grad_w_rec.fill(0)
-        self.grad_w_out.fill(0)
-        return w_rec, w_out
+        return w_rec
+
+    def apply_w_out_update(self, w_out):
+        w_out -= self.eta_out * self.grad_w_out_accumulated + self.eta_out * (2 * self.lambda_w) * w_out
+        self.grad_w_out_accumulated.fill(0)
+        return w_out
 
 # ==========================================
 # ネットワーク全体モデル
@@ -197,8 +199,6 @@ class PredictiveEPropNet:
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
         self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
-        # self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
-
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
         self.B = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(self.n_neurons)
         
@@ -226,7 +226,7 @@ class PredictiveEPropNet:
         self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
         return self.s
 
-    def run_full_epoch(self, target_signal, dt=1.0, record=False):
+    def run_full_epoch(self, target_signal, len_train=10000, len_error=5000, dt=1.0, record=False):
         self.reset_state()
         timesteps = len(target_signal)
         outputs = np.zeros((timesteps, self.n_outputs))
@@ -242,10 +242,10 @@ class PredictiveEPropNet:
             self.rec_f = np.zeros(timesteps) 
             
         for t in range(timesteps):
-            if t < 10000:
+            if t < len_train:
                 phase = "training"
                 xi = 1.0
-            elif t < 15000:
+            elif t < len_train + len_error:
                 phase = "error-driven"
                 xi = 1.0
             else:
@@ -256,7 +256,6 @@ class PredictiveEPropNet:
             
             all_z_bar_bar = np.concatenate([self.lif.z_bar_bar, self.alif.z_bar_bar])
             all_z_bar = np.concatenate([self.lif.z_bar, self.alif.z_bar])
-            # all_z = np.concatenate([self.lif.z, self.alif.z])
             
             y_t = self.w_out @ all_z_bar_bar
             outputs[t] = y_t
@@ -286,12 +285,16 @@ class PredictiveEPropNet:
                     self.rec_z[t] = np.concatenate([self.lif.z, self.alif.z]) > 0
                     self.rec_L[t] = L_t[0].copy()
                     self.rec_e[t] = np.mean(np.abs(self.optimizer.e_trace))
-                    # 修正箇所: 瞬時発火率の計算に統一
                     self.rec_f[t] = np.mean(np.concatenate([self.lif.z, self.alif.z])) * 1000
                 
+                # w_recの更新はt_delayごと
                 if should_update:
-                    self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
+                    self.w_rec = self.optimizer.apply_w_rec_update(self.w_rec)
                     self.w_rec *= self.w_rec_mask
+                
+                # w_outの更新は各エポックのtraining phaseの最後のみ
+                if t == len_train - 1:
+                    self.w_out = self.optimizer.apply_w_out_update(self.w_out)
                 
                 z_bar_prev_prev = z_bar_prev.copy()
                 z_bar_prev = all_z_bar.copy()
@@ -305,7 +308,6 @@ class PredictiveEPropNet:
                     if self.optimizer.step_counter >= self.optimizer.t_delay:
                         self.optimizer.spike_buffer.fill(0)
                         self.optimizer.step_counter = 0
-                    # 修正箇所: 瞬時発火率の計算
                     self.rec_f[t] = np.mean(current_spikes) * 1000 
             
         return outputs
@@ -340,7 +342,7 @@ if __name__ == "__main__":
         print(f"--- Epoch {epoch+1}/{epochs} ---")
         
         do_record = (epoch + 1) % 10 == 0
-        out_all = net.run_full_epoch(target_all, record=do_record)
+        out_all = net.run_full_epoch(target_all, len_train=len_train, len_error=len_error, record=do_record)
         
         loss_train = np.mean((out_all[:len_train] - target_all[:len_train])**2)
         loss_error = np.mean((out_all[len_train:len_train+len_error] - target_all[len_train:len_train+len_error])**2)
@@ -367,7 +369,6 @@ if __name__ == "__main__":
             axes_analysis[2].set_title("Eligibility Trace e (Mean Absolute Value)")
             axes_analysis[2].set_ylabel("e")
             
-            # 修正箇所: 100msの移動平均を適用してプロット
             window = 100
             smoothed_f = np.convolve(net.rec_f, np.ones(window)/window, mode='same')
             axes_analysis[3].plot(t_all, smoothed_f, color='green')
