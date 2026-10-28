@@ -30,7 +30,7 @@ class BaseNeuronGroup:
         self.z = np.zeros(self.n)
         self.z_bar = np.zeros(self.n)
         self.z_bar_bar = np.zeros(self.n)
-        self.q = np.zeros(self.n) + self.c_rd
+        self.q = np.full(self.n, self.c_rd)
         self.psi = np.zeros(self.n)
         self.b = np.full(self.n, self.v_th)
         self.ref_counts = np.zeros(self.n)
@@ -50,7 +50,7 @@ class BaseNeuronGroup:
         self.ref_counts[self.z > 0] = self.t_ref
         
         q_prev = self.q.copy()
-        self.q = self.decay_r * self.q + self.z * self.c_rd
+        self.q = self.decay_r * self.q + self.c_rd * self.z
         self.z_bar_bar = self.decay_d * self.z_bar_bar + q_prev
         
         self.z_bar = self.alpha * self.z_bar + self.z_bar_bar
