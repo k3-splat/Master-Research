@@ -186,12 +186,12 @@ class EPropOptimizer:
         #
         # この順番にすることで、現在の e_trace は
         # 二重フィルタの1ステップ遅れを経て、後続時刻の e_filter に現れる。
-        self.grad_w_rec_accumulated += L_t[:, None] * self.e_filter
+        self.e_filter = self.eps_d - self.eps_r        
 
         self.eps_d = self.decay_d * self.eps_d + self.e_trace
         self.eps_r = self.decay_r * self.eps_r + self.e_trace
 
-        self.e_filter = self.eps_d - self.eps_r
+        self.grad_w_rec_accumulated += L_t[:, None] * self.e_filter
 
         # 出力重みの勾配は元の実装を維持
         self.grad_w_out_accumulated += np.outer(error_t, z_bar_curr)
