@@ -90,8 +90,17 @@ class ALIFGroup(BaseNeuronGroup):
 # 最適化手法 (Predictive E-prop)
 # ==========================================
 class EPropOptimizer:
-    def __init__(self, n_neurons, n_inputs, n_outputs, eta_rec=0.0004, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
+    def __init__(self, n_neurons, n_inputs, n_outputs, dt=1.0, tau_r=50.0, tau_d=125.0,
+                 eta_rec=0.0004, eta_out=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
         self.n_neurons = n_neurons
+        self.dt = dt
+        self.tau_r = tau_r
+        self.tau_d = tau_d
+        
+        self.decay_r = np.exp(-dt / tau_r)
+        self.decay_d = np.exp(-dt / tau_d)
+        self.c_rd = 1.0 / (tau_r * tau_d)
+        
         self.eta_rec = eta_rec
         self.eta_out = eta_out
         self.lambda_reg = lambda_reg
@@ -102,27 +111,33 @@ class EPropOptimizer:
         self.e_trace = np.zeros((n_neurons, n_neurons))
         self.eps_b = np.zeros((n_neurons, n_neurons))
         
+        # 二重フィルタ用の内部状態 (式2)
+        self.q_e = np.zeros((n_neurons, n_neurons)) + self.c_rd
+        self.e_bar_bar = np.zeros((n_neurons, n_neurons))
+        
+        # ホメオスタシス正則化用の通常のトレースの和
+        self.e_trace_sum_t_delays = np.zeros((n_neurons, n_neurons))
+        
         self.grad_w_rec = np.zeros((n_neurons, n_neurons))
         self.grad_w_out = np.zeros((n_outputs, n_neurons))
         self.grad_w_rec_accumulated = np.zeros((n_neurons, n_neurons))
         self.grad_w_out_accumulated = np.zeros((n_outputs, n_neurons))
         
         self.spike_buffer = np.zeros(n_neurons)
-        self.e_trace_sum = np.zeros((n_neurons, n_neurons))
-        self.e_trace_sum_t_delays = np.zeros((n_neurons, n_neurons))
         self.step_counter = 0
         self.f_bar = np.zeros(n_neurons)
 
     def reset_traces(self):
         self.e_trace.fill(0)
         self.eps_b.fill(0)
+        self.q_e.fill(self.c_rd)
+        self.e_bar_bar.fill(0)
+        self.e_trace_sum_t_delays.fill(0)
         self.grad_w_rec.fill(0)
         self.grad_w_out.fill(0)
         self.grad_w_rec_accumulated.fill(0)
         self.grad_w_out_accumulated.fill(0)
         self.spike_buffer.fill(0)
-        self.e_trace_sum.fill(0)
-        self.e_trace_sum_t_delays.fill(0)
         self.step_counter = 0
         self.f_bar.fill(0)
 
@@ -142,9 +157,16 @@ class EPropOptimizer:
             
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
 
-        self.e_trace_sum += self.e_trace
+        # 式2に基づく二重フィルタの更新
+        q_e_prev = self.q_e.copy()
+        self.q_e = self.decay_r * self.q_e + self.e_trace * self.c_rd
+        self.e_bar_bar = self.decay_d * self.e_bar_bar + q_e_prev
+
+        # ホメオスタシス正則化用には通常のトレースの和を蓄積
         self.e_trace_sum_t_delays += self.e_trace
-        self.grad_w_rec_accumulated += L_t[:, None] * self.e_trace_sum
+
+        # w_recの更新には二重フィルタ後の trace を使用
+        self.grad_w_rec_accumulated += L_t[:, None] * self.e_bar_bar
         
         self.grad_w_out_accumulated += np.outer(error_t, z_bar_bar_curr)
         
@@ -158,6 +180,7 @@ class EPropOptimizer:
 
             f_bar = self.spike_buffer / self.t_delay
             reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
+            # 正則化項は通常のトレースの和 (e_trace_sum_t_delays) を適用
             self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum_t_delays
             
             self.spike_buffer.fill(0)
@@ -200,18 +223,20 @@ class PredictiveEPropNet:
         np.fill_diagonal(self.w_rec_mask, 0.0)
         
         self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
-        # self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons * self.density)) * self.w_rec_mask
 
         self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
         self.B = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(self.n_neurons)
         
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.1
+        self.sigma_s = 1.0
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons)
         
-        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs) 
+        self.optimizer = EPropOptimizer(
+            self.n_neurons, n_inputs, n_outputs,
+            dt=self.lif.dt, tau_r=self.lif.tau_r, tau_d=self.lif.tau_d
+        ) 
 
         self.rec_z = None
         self.rec_L = None
@@ -227,7 +252,6 @@ class PredictiveEPropNet:
     def generate_ou_noise(self, dt=1.0):
         decay = np.exp(-dt / self.tau_s)
         self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
-        # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s
 
     def run_full_epoch(self, target_signal, dt=1.0, record=False):
@@ -271,13 +295,13 @@ class PredictiveEPropNet:
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
             
-            total_current = xi * i_in + i_rec + i_fb + self.I_bias # + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.I_bias + s_t
             
             self.lif.step(total_current[:self.n_lif])
             self.alif.step(total_current[self.n_lif:])
             
             if phase == "training":
-                L_t = (self.B @ d_t) * self.lif.c_rd
+                L_t = self.B @ d_t
                 
                 all_psi = np.concatenate([self.lif.psi, self.alif.psi])
                 
@@ -289,7 +313,6 @@ class PredictiveEPropNet:
                     self.rec_z[t] = np.concatenate([self.lif.z, self.alif.z]) > 0
                     self.rec_L[t] = L_t[0].copy()
                     self.rec_e[t] = np.mean(np.abs(self.optimizer.e_trace))
-                    # 修正箇所: 瞬時発火率の計算に統一
                     self.rec_f[t] = np.mean(np.concatenate([self.lif.z, self.alif.z])) * 1000
                 
                 if should_update:
@@ -308,7 +331,6 @@ class PredictiveEPropNet:
                     if self.optimizer.step_counter >= self.optimizer.t_delay:
                         self.optimizer.spike_buffer.fill(0)
                         self.optimizer.step_counter = 0
-                    # 修正箇所: 瞬時発火率の計算
                     self.rec_f[t] = np.mean(current_spikes) * 1000 
             
         return outputs
@@ -370,7 +392,6 @@ if __name__ == "__main__":
             axes_analysis[2].set_title("Eligibility Trace e (Mean Absolute Value)")
             axes_analysis[2].set_ylabel("e")
             
-            # 修正箇所: 100msの移動平均を適用してプロット
             window = 100
             smoothed_f = np.convolve(net.rec_f, np.ones(window)/window, mode='same')
             axes_analysis[3].plot(t_all, smoothed_f, color='green')

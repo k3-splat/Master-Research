@@ -312,7 +312,7 @@ class PredictiveEPropNet:
 
         self.I_bias = 0.02
         self.tau_s = 250.0
-        self.sigma_s = 0.1
+        self.sigma_s = 0.5
         self.mu_s = 0.0
         self.s = np.zeros(self.n_neurons)
 
@@ -413,7 +413,7 @@ class PredictiveEPropNet:
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
 
-            total_current = xi * i_in + i_rec + i_fb + self.I_bias + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.I_bias # + s_t
 
             # ニューロン状態とスパイクを更新
             self.lif.step(total_current[:self.n_lif])
