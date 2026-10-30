@@ -170,9 +170,8 @@ class EPropOptimizer:
         self.e_trace = torch.zeros((n_neurons, n_neurons), device=self.device, dtype=torch.float32)
         self.eps_b = torch.zeros((n_neurons, n_neurons), device=self.device, dtype=torch.float32)
 
-        self.eps_d = torch.zeros((n_neurons, n_neurons), device=self.device, dtype=torch.float32)
-        self.eps_r = torch.zeros((n_neurons, n_neurons), device=self.device, dtype=torch.float32)
-        self.e_filter = torch.zeros((n_neurons, n_neurons), device=self.device, dtype=torch.float32)
+        self.q = torch.zeros((n_neurons, n_neurons), device=self.device, dtype=torch.float32)
+        self.e_bar_bar = torch.zeros((n_neurons, n_neurons), device=self.device, dtype=torch.float32)
 
         self.grad_w_rec = torch.zeros((n_neurons, n_neurons), device=self.device, dtype=torch.float32)
         self.grad_w_out = torch.zeros((n_outputs, n_neurons), device=self.device, dtype=torch.float32)
@@ -188,9 +187,8 @@ class EPropOptimizer:
         self.e_trace.zero_()
         self.eps_b.zero_()
 
-        self.eps_d.zero_()
-        self.eps_r.zero_()
-        self.e_filter.zero_()
+        self.q.zero_()
+        self.e_bar_bar.zero_()
 
         self.grad_w_rec.zero_()
         self.grad_w_out.zero_()
@@ -216,11 +214,10 @@ class EPropOptimizer:
 
             self.e_trace[offset:offset + n_g, :] = psi_curr * (z_bar_prev.unsqueeze(0) - beta * self.eps_b[offset:offset + n_g, :])
 
-        self.e_filter = self.eps_d - self.eps_r
-        self.eps_d = self.decay_d * self.eps_d + self.e_trace
-        self.eps_r = self.decay_r * self.eps_r + self.e_trace
+        self.e_bar_bar = self.decay_d * self.e_bar_bar + self.q
+        self.q = self.decay_r * self.q + self.e_trace
 
-        self.grad_w_rec_accumulated += L_t.unsqueeze(1) * self.e_filter
+        self.grad_w_rec_accumulated += L_t.unsqueeze(1) * self.e_bar_bar
 
         self.grad_w_out_accumulated += torch.outer(error_t, z_bar_curr)
 
@@ -348,7 +345,7 @@ class PredictiveEPropNet:
 
             s_t = self.generate_ou_noise()
 
-            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias # + s_t
 
             self.lif.step(total_current[:self.cfg.n_lif])
             self.alif.step(total_current[self.cfg.n_lif:])

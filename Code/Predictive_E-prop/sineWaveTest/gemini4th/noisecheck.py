@@ -14,13 +14,13 @@ class OUNoiseGenerator:
         self.tau_s = tau_s
         self.sigma_s = sigma_s
         self.mu_s = mu_s
-        self.s = np.zeros(self.n_neurons)
+        self.s = np.full(self.n_neurons, -10.0)
 
     def generate_ou_noise(self, dt=1.0):
         # 元コードの数式に忠実な実装
         decay = np.exp(-dt / self.tau_s)
         # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
-        # self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
+        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * np.sqrt(1.0 - decay ** 2) * np.random.randn(self.n_neurons)
         return self.s.copy()
 
 def main():
@@ -32,7 +32,7 @@ def main():
     # ジェネレータのインスタンス化
     generator = OUNoiseGenerator(
         n_neurons=n_neurons, 
-        tau_s=250.0, 
+        tau_s=1000.0, 
         sigma_s=1.0, 
         mu_s=0.0
     )

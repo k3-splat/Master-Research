@@ -1,155 +1,204 @@
+import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
 import os
+from dataclasses import dataclass
+import math
+
+# ==========================================
+# ハイパーパラメータ設定
+# ==========================================
+@dataclass
+class EPropConfig:
+    # ニューロン・ネットワークのスケール
+    n_inputs: int = 1
+    n_lif: int = 100
+    n_alif: int = 200
+    n_outputs: int = 1
+    
+    # 時間・シミュレーション設定
+    dt: float = 1.0
+    len_train: int = 10000
+    len_error: int = 5000
+    len_free: int = 5000
+    epochs: int = 50
+    
+    # ニューロンモデルパラメータ
+    tau_mem: float = 20.0
+    tau_r: float = 50.0
+    tau_d: float = 125.0
+    v_th: float = 0.6
+    gamma_d: float = 0.3
+    t_ref: float = 5.0
+    tau_alif: float = 2000.0
+    beta: float = 0.0174
+    
+    # ネットワーク結合パラメータ
+    g: float = 150.0
+    density: float = 0.01
+    I_bias: float = 0.02
+    
+    # ノイズパラメータ (Ornstein-Uhlenbeck)
+    tau_s: float = 250.0
+    sigma_s: float = 1.0
+    mu_s: float = 0.0
+    
+    # E-prop学習最適化パラメータ
+    eta: float = 0.0004
+    lambda_reg: float = 2.0
+    lambda_w: float = 5e-6
+    t_delay: int = 10
+    f_star: float = 0.01
+    
+    # サイン波タスクターゲットパラメータ
+    A: float = 0.4
+    T: float = 1000.0
+    phi: float = 0.0
+    c: float = 0.0
+
+    @property
+    def n_neurons(self) -> int:
+        return self.n_lif + self.n_alif
+    
+    @property
+    def total_time(self) -> int:
+        return self.len_train + self.len_error + self.len_free
+
+# GPUデバイスの検出
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # ==========================================
 # ニューロンモデル
 # ==========================================
 class BaseNeuronGroup:
-    def __init__(self, n_neurons, dt=1.0, tau_mem=20.0, tau_r=50.0, tau_d=125.0, v_th=0.6, gamma_d=0.3, t_ref=5.0):
+    def __init__(self, cfg: EPropConfig, n_neurons: int):
+        self.cfg = cfg
         self.n = n_neurons
-        self.dt = dt
-        # パラメータ出力用に保持
-        self.tau_mem = tau_mem
-        self.tau_r = tau_r
-        self.tau_d = tau_d
-        self.v_th = v_th
-        self.gamma_d = gamma_d
-        self.t_ref = t_ref
         
         # Eq. 1: alpha = exp(-dt / tau_mem)
-        self.alpha = np.exp(-dt / tau_mem)
+        self.alpha = math.exp(-cfg.dt / cfg.tau_mem)
         # Eq. 2: decay constants for double exponential filter
-        self.decay_r = np.exp(-dt / tau_r)
-        self.decay_d = np.exp(-dt / tau_d)
+        self.decay_r = math.exp(-cfg.dt / cfg.tau_r)
+        self.decay_d = math.exp(-cfg.dt / cfg.tau_d)
         
         # Eq. 2: c_rd = 1 / (tau_r * tau_d)
-        self.c_rd = 1.0 / (tau_r * tau_d)
+        self.c_rd = 1.0 / (cfg.tau_r * cfg.tau_d)
         
         self.reset_state()
 
     def reset_state(self):
-        self.v = np.zeros(self.n)
-        self.z = np.zeros(self.n)
-        self.z_bar = np.zeros(self.n)
-        self.z_bar_bar = np.zeros(self.n)
-        # Eq. 2: q^0 = 1 / (tau_r * tau_d) に準拠した初期化
-        self.q = np.zeros(self.n) + self.c_rd
-        self.psi = np.zeros(self.n)
-        self.b = np.full(self.n, self.v_th)
-        self.ref_counts = np.zeros(self.n)
+        self.v = torch.zeros(self.n, device=device)
+        self.z = torch.zeros(self.n, device=device)
+        self.z_bar = torch.zeros(self.n, device=device)
+        self.z_bar_bar = torch.zeros(self.n, device=device)
+        # Eq. 2: q^0 = 1 / (tau_r * tau_d)
+        self.q = torch.full((self.n,), self.c_rd, device=device)
+        self.psi = torch.zeros(self.n, device=device)
+        self.b = torch.full((self.n,), self.cfg.v_th, device=device)
+        self.ref_counts = torch.zeros(self.n, device=device)
 
     def _update_spikes_and_filters(self, v_next_raw, b_next):
         # Eq. 7: テンソル微分の近似 (Tent surrogate gradient)
-        self.psi = (self.gamma_d / self.v_th) * np.maximum(0, 1.0 - np.abs((v_next_raw - b_next) / self.v_th))
+        self.psi = (self.cfg.gamma_d / self.cfg.v_th) * torch.clamp(
+            1.0 - torch.abs((v_next_raw - b_next) / self.cfg.v_th), min=0.0
+        )
         
-        # 【追加】不応期中の擬似微分を0にマスクする（幻の勾配を防ぐ）
+        # 不応期中の擬似微分を0にマスク
         is_currently_refractory = self.ref_counts > 0
         self.psi[is_currently_refractory] = 0.0
         
-        # Eq. 1: z_i^t = theta(v_i^t - b_i^t) (不応期考慮)
-        self.z = np.where((v_next_raw > b_next) & (~is_currently_refractory), 1.0, 0.0)
+        # Eq. 1: z_i^t = theta(v_i^t - b_i^t)
+        self.z = torch.where((v_next_raw > b_next) & (~is_currently_refractory), 1.0, 0.0)
         
-        # Eq. 1: Repolarization mechanism (- z_i^t * b_i^t)
+        # Eq. 1: Repolarization mechanism
         v_next = v_next_raw - self.z * b_next
         
         # Section 2.1: 不応期の適用 (5 ms)
-        v_next[is_currently_refractory] = self.v[is_currently_refractory] # 不応期中のニューロンの膜電位を固定
+        v_next[is_currently_refractory] = self.v[is_currently_refractory]
         
-        self.ref_counts = np.maximum(0, self.ref_counts - self.dt)
-        self.ref_counts[self.z > 0] = self.t_ref
+        self.ref_counts = torch.clamp(self.ref_counts - self.cfg.dt, min=0.0)
+        self.ref_counts[self.z > 0] = self.cfg.t_ref
         
-        # Eq. 2: 2重指数関数フィルター (Double exponential filter)
-        q_prev = self.q.copy()
+        # Eq. 2: 2重指数関数フィルター
+        self.z_bar_bar = self.decay_d * self.z_bar_bar + self.q
         self.q = self.decay_r * self.q + self.c_rd * self.z
-        self.z_bar_bar = self.decay_d * self.z_bar_bar + q_prev
         
-        # Section 2.2: 単一低周波フィルター (LIF trace: eps_v = z_bar_i^t = alpha * z_bar_i^{t-1} + z_bar_bar_i^t)
+        # Section 2.2: 単一低周波フィルター
         self.z_bar = self.alpha * self.z_bar + self.z_bar_bar
 
         self.v = v_next
         self.b = b_next
 
 class LIFGroup(BaseNeuronGroup):
-    def __init__(self, n_neurons, **kwargs):
-        super().__init__(n_neurons, **kwargs)
+    def __init__(self, cfg: EPropConfig, n_neurons: int):
+        super().__init__(cfg, n_neurons)
         self.beta = 0.0
 
     def step(self, input_current):
-        # Eq. 1: v_i^{t+1} (入力電流統合前の線形部: alpha * v_i^t + I_syn)
         v_next_raw = self.alpha * self.v + input_current
-        # LIF neurons: b_i^t = v_th (固定閾値, beta = 0)
-        b_next = np.full(self.n, self.v_th)
+        b_next = torch.full((self.n,), self.cfg.v_th, device=device)
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 class ALIFGroup(BaseNeuronGroup):
-    def __init__(self, n_neurons, tau_alif=2000.0, beta=0.0174, **kwargs):
-        super().__init__(n_neurons, **kwargs)
-        # パラメータ出力用に保持
-        self.tau_alif = tau_alif
-        self.beta = beta
-        # Section 2.1: rho = exp(-dt / tau_alif)
-        self.rho = np.exp(-self.dt / tau_alif)
-        self.a = np.zeros(self.n)
+    def __init__(self, cfg: EPropConfig, n_neurons: int):
+        super().__init__(cfg, n_neurons)
+        self.beta = cfg.beta
+        self.rho = math.exp(-cfg.dt / cfg.tau_alif)
+        self.a = torch.zeros(self.n, device=device)
 
     def reset_state(self):
         super().reset_state()
-        self.a = np.zeros(self.n)
+        self.a = torch.zeros(self.n, device=device)
 
     def step(self, input_current):
-        # Section 2.1: a_i^t = rho * a_i^{t-1} + z_i^{t-1}
         self.a = self.rho * self.a + self.z
-        # Eq. 1: v_i^{t+1} (線形部)
         v_next_raw = self.alpha * self.v + input_current
-        # Section 2.1: b_i^t = v_th + beta * a_i^t (適応閾値)
-        b_next = self.v_th + self.beta * self.a
+        b_next = self.cfg.v_th + self.beta * self.a
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 # ==========================================
 # 最適化手法 (Predictive E-prop with Adam)
 # ==========================================
 class EPropOptimizer:
-    def __init__(self, n_neurons, n_inputs, n_outputs, eta=0.0004, lambda_reg=2.0, lambda_w=5e-6, t_delay=10, f_star=0.01):
-        self.n_neurons = n_neurons
-        self.eta = eta
-        self.lambda_reg = lambda_reg
-        self.lambda_w = lambda_w
-        self.t_delay = t_delay
-        self.f_star = f_star
+    def __init__(self, cfg: EPropConfig):
+        self.cfg = cfg
+        n = cfg.n_neurons
+        nout = cfg.n_outputs
         
-        self.e_trace = np.zeros((n_neurons, n_neurons))
-        self.eps_b = np.zeros((n_neurons, n_neurons))
+        self.e_trace = torch.zeros((n, n), device=device)
+        self.eps_b = torch.zeros((n, n), device=device)
         
-        self.grad_w_rec = np.zeros((n_neurons, n_neurons))
-        self.grad_w_out = np.zeros((n_outputs, n_neurons))
-        self.grad_w_rec_accumulated = np.zeros((n_neurons, n_neurons))
-        self.grad_w_out_accumulated = np.zeros((n_outputs, n_neurons))
+        self.grad_w_rec = torch.zeros((n, n), device=device)
+        self.grad_w_out = torch.zeros((nout, n), device=device)
+        self.grad_w_rec_accumulated = torch.zeros((n, n), device=device)
+        self.grad_w_out_accumulated = torch.zeros((nout, n), device=device)
         
-        self.spike_buffer = np.zeros(n_neurons)
-        self.e_trace_sum = np.zeros((n_neurons, n_neurons))
+        self.spike_buffer = torch.zeros(n, device=device)
+        self.e_trace_sum = torch.zeros((n, n), device=device)
         self.step_counter = 0
 
-        # Adam オプティマイザのパラメータ
+        # Adamパラメータ
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.epsilon = 1e-8
         self.adam_t = 0
         
-        self.m_w_rec = np.zeros((n_neurons, n_neurons))
-        self.v_w_rec = np.zeros((n_neurons, n_neurons))
-        self.m_w_out = np.zeros((n_outputs, n_neurons))
-        self.v_w_out = np.zeros((n_outputs, n_neurons))
+        self.m_w_rec = torch.zeros((n, n), device=device)
+        self.v_w_rec = torch.zeros((n, n), device=device)
+        self.m_w_out = torch.zeros((nout, n), device=device)
+        self.v_w_out = torch.zeros((nout, n), device=device)
 
     def reset_traces(self):
-        self.e_trace.fill(0)
-        self.eps_b.fill(0)
-        self.grad_w_rec.fill(0)
-        self.grad_w_out.fill(0)
-        self.grad_w_rec_accumulated.fill(0)
-        self.grad_w_out_accumulated.fill(0)
-        self.spike_buffer.fill(0)
-        self.e_trace_sum.fill(0)
+        self.e_trace.zero_()
+        self.eps_b.zero_()
+        self.grad_w_rec.zero_()
+        self.grad_w_out.zero_()
+        self.grad_w_rec_accumulated.zero_()
+        self.grad_w_out_accumulated.zero_()
+        self.spike_buffer.zero_()
+        self.e_trace_sum.zero_()
         self.step_counter = 0
 
     def update_traces_and_gradients(self, neurons, z_bar_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
@@ -159,46 +208,36 @@ class EPropOptimizer:
             beta = neuron_group.beta
             rho = getattr(neuron_group, 'rho', 0.0)
             
-            psi_curr = neuron_group.psi[:, None]
-            psi_prev_g = psi_prev[offset:offset+n_g, None]
+            psi_curr = neuron_group.psi.unsqueeze(1)
+            psi_prev_g = psi_prev[offset:offset+n_g].unsqueeze(1)
             
             if beta > 0:
-                # Eq. 9: eps_b,ij^t = psi_i^{t-1} * z_bar_j^{t-2} + (rho - beta * psi_i^{t-1}) * eps_b,ij^{t-1}
                 self.eps_b[offset:offset+n_g, :] = psi_prev_g * z_bar_prev_prev + \
                                                   (rho - beta * psi_prev_g) * self.eps_b[offset:offset+n_g, :]
             
-            # Eq. 10: e_ij^t = psi_i^t * (z_bar_j^{t-1} - beta * eps_b,ij^t)
             self.e_trace[offset:offset+n_g, :] = psi_curr * (z_bar_prev - beta * self.eps_b[offset:offset+n_g, :])
         
-        # 毎ステップの勾配を蓄積
-        # Eq. 3: Delta W_ij^rec = eta * sum_t ( L_i^t * e_ij^t )
-        # 【修正】 L_tは誤差を減らす方向(-∇E)を向いているため、勾配(∇E)として蓄積するには減算する
-        self.grad_w_rec_accumulated -= L_t[:, None] * self.e_trace
-        # Eq. 11: 出力 y_i^t = sum W_ij^out * z_bar_bar_j^t (更新には z_bar_curr を使用)
-        self.grad_w_out_accumulated += np.outer(error_t, z_bar_bar_curr)
+        # 勾配の蓄積
+        self.grad_w_rec_accumulated -= L_t.unsqueeze(1) * self.e_trace
+        # 修正箇所: error_tの次元が消滅しないよう .squeeze(-1) を .view(-1) に変更
+        self.grad_w_out_accumulated += torch.outer(error_t.view(-1), z_bar_bar_curr)
         
-        all_spikes = np.concatenate([g.z for g in neurons])
+        all_spikes = torch.cat([g.z for g in neurons])
         self.spike_buffer += all_spikes
         self.e_trace_sum += self.e_trace
         self.step_counter += 1
         
-        # t_delayごとに更新判定を返す
-        if self.step_counter >= self.t_delay:
-            # t_delay間の蓄積勾配を実際の更新用勾配へコピー
-            self.grad_w_rec = self.grad_w_rec_accumulated.copy()
-            self.grad_w_out = self.grad_w_out_accumulated.copy()
+        if self.step_counter >= self.cfg.t_delay:
+            self.grad_w_rec = self.grad_w_rec_accumulated.clone()
+            self.grad_w_out = self.grad_w_out_accumulated.clone()
 
-            # Eq. S1 & S3: ホメオスタシス正則化 (Homeostatic plasticity / Firing rate regularization)
-            f_bar = self.spike_buffer / self.t_delay
-            # d(E_reg)/dW_ij^rec = (lambda_reg / t_delay) * (f_bar_i - f^*) * sum e_ij
-            reg_signal = (self.lambda_reg / self.t_delay) * (f_bar - self.f_star)
-            self.grad_w_rec += reg_signal[:, None] * self.e_trace_sum
+            # ホメオスタシス正則化
+            f_bar = self.spike_buffer / self.cfg.t_delay
+            reg_signal = (self.cfg.lambda_reg / self.cfg.t_delay) * (f_bar - self.cfg.f_star)
+            self.grad_w_rec += reg_signal.unsqueeze(1) * self.e_trace_sum
             
-            # バッファクリア
-            self.spike_buffer.fill(0)
-            self.e_trace_sum.fill(0)
-            # self.grad_w_rec_accumulated.fill(0)
-            # self.grad_w_out_accumulated.fill(0)
+            self.spike_buffer.zero_()
+            self.e_trace_sum.zero_()
             self.step_counter = 0
             return True
         return False
@@ -206,99 +245,87 @@ class EPropOptimizer:
     def apply_weight_update(self, w_rec, w_out):
         self.adam_t += 1
         
-        # 損失関数の勾配 (正則化項を含む L2 Weight Decay)
-        g_w_rec = self.grad_w_rec + 2 * self.lambda_w * w_rec
-        g_w_out = self.grad_w_out + 2 * self.lambda_w * w_out
+        g_w_rec = self.grad_w_rec + 2 * self.cfg.lambda_w * w_rec
+        g_w_out = self.grad_w_out + 2 * self.cfg.lambda_w * w_out
         
-        # Adam: w_rec の更新
+        # Adam: w_rec
         self.m_w_rec = self.beta1 * self.m_w_rec + (1 - self.beta1) * g_w_rec
         self.v_w_rec = self.beta2 * self.v_w_rec + (1 - self.beta2) * (g_w_rec ** 2)
         m_hat_rec = self.m_w_rec / (1 - self.beta1 ** self.adam_t)
         v_hat_rec = self.v_w_rec / (1 - self.beta2 ** self.adam_t)
-        w_rec -= self.eta * m_hat_rec / (np.sqrt(v_hat_rec) + self.epsilon)
+        w_rec -= self.cfg.eta * m_hat_rec / (torch.sqrt(v_hat_rec) + self.epsilon)
 
-        # Adam: w_out の更新
+        # Adam: w_out
         self.m_w_out = self.beta1 * self.m_w_out + (1 - self.beta1) * g_w_out
         self.v_w_out = self.beta2 * self.v_w_out + (1 - self.beta2) * (g_w_out ** 2)
         m_hat_out = self.m_w_out / (1 - self.beta1 ** self.adam_t)
         v_hat_out = self.v_w_out / (1 - self.beta2 ** self.adam_t)
-        w_out -= self.eta * m_hat_out / (np.sqrt(v_hat_out) + self.epsilon)
+        w_out -= self.cfg.eta * m_hat_out / (torch.sqrt(v_hat_out) + self.epsilon)
         
-        self.grad_w_rec.fill(0)
-        self.grad_w_out.fill(0)
+        self.grad_w_rec.zero_()
+        self.grad_w_out.zero_()
         return w_rec, w_out
 
 # ==========================================
 # ネットワーク全体モデル
 # ==========================================
 class PredictiveEPropNet:
-    def __init__(self, n_inputs, n_lif, n_alif, n_outputs, g=150.0):
-        self.n_inputs = n_inputs
-        self.n_lif = n_lif
-        self.n_alif = n_alif
-        self.n_neurons = n_lif + n_alif
-        self.n_outputs = n_outputs
-        # パラメータ出力用に保持
-        self.g = g
+    def __init__(self, cfg: EPropConfig):
+        self.cfg = cfg
         
-        self.lif = LIFGroup(n_lif)
-        self.alif = ALIFGroup(n_alif)
+        self.lif = LIFGroup(cfg, cfg.n_lif)
+        self.alif = ALIFGroup(cfg, cfg.n_alif)
         self.neurons = [self.lif, self.alif]
         
-        # Section 2.1: W^in, W^fb ~ N(0, 1) / sqrt(g)
-        self.w_in = np.random.randn(self.n_neurons, n_inputs) / np.sqrt(g)
-        self.w_fb = np.random.randn(self.n_neurons, n_outputs) / np.sqrt(g)
+        n = cfg.n_neurons
         
-        # Section 2.1 & Table SI: W^rec ~ N(0, 1) / sqrt(N_rec), Sparsity = 0.99 (結合密度 1%)
-        self.density = 0.01
-        self.w_rec_mask = (np.random.rand(self.n_neurons, self.n_neurons) < self.density).astype(float)
+        # W^in, W^fb ~ N(0, 1) / sqrt(g)
+        self.w_in = torch.randn(n, cfg.n_inputs, device=device) / math.sqrt(cfg.g)
+        self.w_fb = torch.randn(n, cfg.n_outputs, device=device) / math.sqrt(cfg.g)
         
-        # 【追加】自己結合（対角成分）を無効化
-        np.fill_diagonal(self.w_rec_mask, 0.0)
+        # W^rec (Sparsity = 0.99)
+        self.w_rec_mask = (torch.rand(n, n, device=device) < cfg.density).float()
+        self.w_rec_mask.fill_diagonal_(0.0)
+        self.w_rec = (torch.randn(n, n, device=device) / math.sqrt(n)) * self.w_rec_mask
         
-        self.w_rec = (np.random.randn(self.n_neurons, self.n_neurons) / np.sqrt(self.n_neurons)) * self.w_rec_mask
+        # W^out ~ N(0, 1) / sqrt(N_rec)
+        self.w_out = torch.randn(cfg.n_outputs, n, device=device) / math.sqrt(n)
         
-        # Section 2.1: W^out ~ N(0, 1) / sqrt(N_rec)
-        self.w_out = np.random.randn(n_outputs, self.n_neurons) / np.sqrt(self.n_neurons)
-        # Eq. 5: 誤差入力重み W^in の駆動方向と矛盾しないように固定行列 B を整合させる
-        self.B = -self.w_in * np.sqrt(g)
+        self.B = -self.w_in * math.sqrt(cfg.g)
+        self.s = torch.full((n,), -10, device=device)
         
-        # パラメータ出力用に保持
-        self.I_bias = 0.02
-        self.tau_s = 250.0
-        self.sigma_s = 1.0
-        self.mu_s = 0.0
-        self.s = np.zeros(self.n_neurons) # 各ニューロンに独立したノイズを流す
-        
-        self.optimizer = EPropOptimizer(self.n_neurons, n_inputs, n_outputs, eta=0.0004) 
+        self.optimizer = EPropOptimizer(cfg) 
 
     def reset_state(self):
         self.lif.reset_state()
         self.alif.reset_state()
         self.optimizer.reset_traces()
-        self.s = np.zeros(self.n_neurons)
+        self.s.zero_()
 
-    def generate_ou_noise(self, dt=1.0):
-        # Section 2.1: Ornstein-Uhlenbeck noise s (拡散項に dt / tau_s のスケーリングを適用)
-        decay = np.exp(-dt / self.tau_s)
-        self.s = self.mu_s + (self.s - self.mu_s) * decay + self.sigma_s * (dt / self.tau_s) * np.random.randn(self.n_neurons)
+    def generate_ou_noise(self):
+        decay = math.exp(-self.cfg.dt / self.cfg.tau_s)
+        self.s = self.cfg.mu_s + (self.s - self.cfg.mu_s) * decay + \
+                 self.cfg.sigma_s * (self.cfg.dt / self.cfg.tau_s) * torch.randn(self.cfg.n_neurons, device=device)
         return self.s
 
-    def run_full_epoch(self, target_signal, dt=1.0):
+    @torch.no_grad()
+    def run_full_epoch(self, target_signal: torch.Tensor):
         self.reset_state()
-        timesteps = len(target_signal)
-        outputs = np.zeros((timesteps, self.n_outputs))
+        timesteps = target_signal.shape[0]
+        outputs = torch.zeros((timesteps, self.cfg.n_outputs), device=device)
         
-        z_bar_prev = np.zeros(self.n_neurons)
-        z_bar_prev_prev = np.zeros(self.n_neurons)
-        psi_prev = np.zeros(self.n_neurons)
+        z_bar_prev = torch.zeros(self.cfg.n_neurons, device=device)
+        z_bar_prev_prev = torch.zeros(self.cfg.n_neurons, device=device)
+        psi_prev = torch.zeros(self.cfg.n_neurons, device=device)
+        
+        # 各フェーズにおけるスパイク数をカウントする辞書を初期化
+        spike_counts = {"training": 0.0, "error-driven": 0.0, "free-running": 0.0}
         
         for t in range(timesteps):
-            # Section 2.3 & Figure 1B: 実験フェーズ制御
-            if t < 10000:
+            if t < self.cfg.len_train:
                 phase = "training"
                 xi = 1.0
-            elif t < 15000:
+            elif t < self.cfg.len_train + self.cfg.len_error:
                 phase = "error-driven"
                 xi = 1.0
             else:
@@ -307,162 +334,146 @@ class PredictiveEPropNet:
 
             x_t = target_signal[t]
             
-            # z_bar_bar (二重指数フィルタ後) を用いて出力を計算
-            # Section 2.1: y_i^t = sum_k W_ik^out * z_bar_bar_i^t
-            all_z_bar_bar = np.concatenate([self.lif.z_bar_bar, self.alif.z_bar_bar])
-            all_z_bar = np.concatenate([self.lif.z_bar, self.alif.z_bar])
+            all_z_bar_bar = torch.cat([self.lif.z_bar_bar, self.alif.z_bar_bar])
+            all_z_bar = torch.cat([self.lif.z_bar, self.alif.z_bar])
             
             y_t = self.w_out @ all_z_bar_bar
             outputs[t] = y_t
             
-            # Section 2.1: 予測誤差 d_j^t = y_j^t - x_j^t
             d_t = y_t - x_t
-            s_t = self.generate_ou_noise(dt)
+            s_t = self.generate_ou_noise()
             
-            # Eq. 1: 入力電流統合 (sum W_ij^rec * z_bar_bar_j^t)
             i_rec = self.w_rec @ all_z_bar_bar
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
             
-            total_current = xi * i_in + i_rec + i_fb + self.I_bias + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias + s_t
             
-            self.lif.step(total_current[:self.n_lif])
-            self.alif.step(total_current[self.n_lif:])
+            self.lif.step(total_current[:self.cfg.n_lif])
+            self.alif.step(total_current[self.cfg.n_lif:])
+            
+            # 発火率計算用に全ニューロンのスパイクを合算
+            current_spikes = self.lif.z.sum() + self.alif.z.sum()
+            spike_counts[phase] += current_spikes.item()
             
             if phase == "training":
                 L_t = self.B @ d_t * self.lif.c_rd
+                all_psi = torch.cat([self.lif.psi, self.alif.psi])
                 
-                all_psi = np.concatenate([self.lif.psi, self.alif.psi])
-                
-                # 出力層勾配用に all_z_bar を渡し、トレース計算用には過去の低周波フィルタ z_bar_prev, z_bar_prev_prev を渡す
                 should_update = self.optimizer.update_traces_and_gradients(
                     self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t
                 )
                 
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
-                    # スパース結合構造と対角成分0の維持
                     self.w_rec *= self.w_rec_mask
                 
-                z_bar_prev_prev = z_bar_prev.copy()
-                z_bar_prev = all_z_bar.copy()
-                psi_prev = all_psi.copy()
+                z_bar_prev_prev = z_bar_prev.clone()
+                z_bar_prev = all_z_bar.clone()
+                psi_prev = all_psi.clone()
+        
+        # フェーズごとのネットワーク平均発火率 (Hz) を計算
+        firing_rates = {
+            "training": (spike_counts["training"] / (self.cfg.n_neurons * self.cfg.len_train)) * (1000.0 / self.cfg.dt),
+            "error-driven": (spike_counts["error-driven"] / (self.cfg.n_neurons * self.cfg.len_error)) * (1000.0 / self.cfg.dt),
+            "free-running": (spike_counts["free-running"] / (self.cfg.n_neurons * self.cfg.len_free)) * (1000.0 / self.cfg.dt),
+        }
             
-        return outputs
+        return outputs, firing_rates
 
 # ==========================================
 # タスク実行とグラフ描画
 # ==========================================
 if __name__ == "__main__":
-    # Table SI: 正弦波タスクのパラメータ設定
-    # A = 0.4, T = 1000 ms, phi = 0, c = 0
-    A, T, phi, c = 0.4, 1000.0, 0.0, 0.0
+    # Configインスタンスの作成
+    cfg = EPropConfig()
     
-    # フェーズ長の設定 (パラメータ出力用に明示的変数化)
-    len_train = 10000
-    len_error = 5000
-    len_free = 5000
-    total_time = len_train + len_error + len_free
+    t_all = torch.arange(0, cfg.total_time, cfg.dt, device=device)
     
-    t_all = np.arange(0, total_time, 1)
-    
-    # Eq. 14: x(t) = A * sin((2 * pi / T) * t + phi) + c
     def sine_wave(t_array):
-        return A * np.sin((2 * np.pi / T) * t_array + phi) + c
+        return cfg.A * torch.sin((2 * math.pi / cfg.T) * t_array + cfg.phi) + cfg.c
 
-    target_all = sine_wave(t_all).reshape(-1, 1)
+    target_all = sine_wave(t_all).view(-1, 1)
     
-    net = PredictiveEPropNet(n_inputs=1, n_lif=100, n_alif=200, n_outputs=1)
-    
-    epochs = 50
+    net = PredictiveEPropNet(cfg)
     out_all = None
     
-    for epoch in range(epochs):
-        print(f"--- Epoch {epoch+1}/{epochs} ---")
+    # 平均発火率の推移を記録するリスト
+    rate_history_train = []
+    rate_history_error = []
+    rate_history_free = []
+    
+    for epoch in range(cfg.epochs):
+        print(f"--- Epoch {epoch+1}/{cfg.epochs} ---")
         
-        out_all = net.run_full_epoch(target_signal=target_all)
+        out_all, firing_rates = net.run_full_epoch(target_signal=target_all)
         
-        # Eq. 4: 評価用平均二乗誤差 (Loss = mean((y - x)^2))
-        loss_train = np.mean((out_all[:len_train] - target_all[:len_train])**2)
-        loss_error = np.mean((out_all[len_train:len_train+len_error] - target_all[len_train:len_train+len_error])**2)
-        loss_free = np.mean((out_all[len_train+len_error:] - target_all[len_train+len_error:])**2)
+        loss_train = torch.mean((out_all[:cfg.len_train] - target_all[:cfg.len_train])**2).item()
+        loss_error = torch.mean((out_all[cfg.len_train:cfg.len_train+cfg.len_error] - target_all[cfg.len_train:cfg.len_train+cfg.len_error])**2).item()
+        loss_free = torch.mean((out_all[cfg.len_train+cfg.len_error:] - target_all[cfg.len_train+cfg.len_error:])**2).item()
         
-        print(f"  Training Loss: {loss_train:.5f}")
-        print(f"  Error-driven Loss: {loss_error:.5f}")
-        print(f"  Free-running Loss: {loss_free:.5f}")
+        rate_history_train.append(firing_rates["training"])
+        rate_history_error.append(firing_rates["error-driven"])
+        rate_history_free.append(firing_rates["free-running"])
+        
+        print(f"  [Loss] Train: {loss_train:.5f} | Error-driven: {loss_error:.5f} | Free-running: {loss_free:.5f}")
+        print(f"  [Rate] Train: {firing_rates['training']:.2f} Hz | Error-driven: {firing_rates['error-driven']:.2f} Hz | Free-running: {firing_rates['free-running']:.2f} Hz")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs("outputnext", exist_ok=True)
     
-    # 出力先ディレクトリの確保
-    os.makedirs("output", exist_ok=True)
+    # テンソルをCPU上のNumPy配列に変換
+    t_all_np = t_all.cpu().numpy()
+    target_all_np = target_all.cpu().numpy()
+    out_all_np = out_all.cpu().numpy()
     
     # --- 画像ファイルの出力 ---
-    img_filename = f"output/predictive_eprop_result_{timestamp}.png"
+    img_filename = f"outputNext/predictive_eprop_result_{timestamp}.png"
+    # サブプロットを4つに変更 (サイン波生成結果 x 3フェーズ + 平均発火率 x 1)
+    fig, axes = plt.subplots(4, 1, figsize=(10, 10))
     
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8))
+    t1, t2 = cfg.len_train, cfg.len_train + cfg.len_error
     
-    axes[0].plot(t_all[:len_train], target_all[:len_train], label="Target", color="black", linestyle="--")
-    axes[0].plot(t_all[:len_train], out_all[:len_train], label="Output", color="blue", alpha=0.7)
+    axes[0].plot(t_all_np[:t1], target_all_np[:t1], label="Target", color="black", linestyle="--")
+    axes[0].plot(t_all_np[:t1], out_all_np[:t1], label="Output", color="blue", alpha=0.7)
     axes[0].set_title("Training Phase")
     axes[0].set_ylabel("Signal")
     axes[0].legend(loc="upper right")
     
-    axes[1].plot(t_all[len_train:len_train+len_error], target_all[len_train:len_train+len_error], label="Target", color="black", linestyle="--")
-    axes[1].plot(t_all[len_train:len_train+len_error], out_all[len_train:len_train+len_error], label="Output", color="orange", alpha=0.7)
+    axes[1].plot(t_all_np[t1:t2], target_all_np[t1:t2], label="Target", color="black", linestyle="--")
+    axes[1].plot(t_all_np[t1:t2], out_all_np[t1:t2], label="Output", color="orange", alpha=0.7)
     axes[1].set_title("Error-driven Phase")
     axes[1].set_ylabel("Signal")
     axes[1].legend(loc="upper right")
     
-    axes[2].plot(t_all[len_train+len_error:], target_all[len_train+len_error:], label="Target", color="black", linestyle="--")
-    axes[2].plot(t_all[len_train+len_error:], out_all[len_train+len_error:], label="Output", color="green", alpha=0.7)
+    axes[2].plot(t_all_np[t2:], target_all_np[t2:], label="Target", color="black", linestyle="--")
+    axes[2].plot(t_all_np[t2:], out_all_np[t2:], label="Output", color="green", alpha=0.7)
     axes[2].set_title("Free-running Phase")
     axes[2].set_xlabel("Time [ms]")
     axes[2].set_ylabel("Signal")
     axes[2].legend(loc="upper right")
     
+    # 平均発火率の推移プロットの追加
+    epochs_range = range(1, cfg.epochs + 1)
+    axes[3].plot(epochs_range, rate_history_train, label="Training", color="blue")
+    axes[3].plot(epochs_range, rate_history_error, label="Error-driven", color="orange")
+    axes[3].plot(epochs_range, rate_history_free, label="Free-running", color="green")
+    axes[3].set_title("Average Firing Rate across Epochs")
+    axes[3].set_xlabel("Epoch")
+    axes[3].set_ylabel("Firing Rate [Hz]")
+    axes[3].legend(loc="lower right")
+    axes[3].grid(True, linestyle="--", alpha=0.7)
+    
     plt.tight_layout()
     plt.savefig(img_filename)
     print(f"\nプロットを画像ファイル '{img_filename}' として保存しました。")
     
-    # --- スクリプトで使用されたパラメータのファイル出力 ---
-    param_filename = f"output/predictive_eprop_params_{timestamp}.txt"
-    
-    # クラスインスタンス等から実行時の実際の値を抽出
-    actual_params = {
-        "training phase (ms)": len_train,
-        "error-driven phase (ms)": len_error,
-        "free-running phase (ms)": len_free,
-        "eta (η)": net.optimizer.eta,
-        "lambda_W": net.optimizer.lambda_w,
-        "lambda_reg": net.optimizer.lambda_reg,
-        "gamma_d": net.lif.gamma_d,
-        "time step (dt)": net.lif.dt,
-        "t_delay": net.optimizer.t_delay,
-        "f_star": net.optimizer.f_star,
-        "A": A,
-        "T": T,
-        "phi (φ)": phi,
-        "c": c,
-        "N_LIF": net.n_lif,
-        "N_ALIF": net.n_alif,
-        "sparsity": 1.0 - net.density, # densityからsparsityへ変換
-        "tau_s": net.tau_s,
-        "sigma_s": net.sigma_s,
-        "mu_s": net.mu_s,
-        "g": net.g,
-        "v_th": net.lif.v_th,
-        "I_bias": net.I_bias,
-        "tau_mem": net.lif.tau_mem,
-        "tau_alif": net.alif.tau_alif,
-        "tau_r": net.lif.tau_r,
-        "tau_d": net.lif.tau_d,
-        "t_ref": net.lif.t_ref
-    }
-
+    # --- パラメータ出力 ---
+    param_filename = f"outputNext/predictive_eprop_params_{timestamp}.txt"
     with open(param_filename, "w", encoding="utf-8") as f:
         f.write("スクリプト内で使用されたハイパーパラメータ一覧\n")
         f.write("=" * 60 + "\n")
-        for key, value in actual_params.items():
+        for key, value in cfg.__dict__.items():
             f.write(f"{key}: {value}\n")
             
     print(f"スクリプトで使用されたパラメータ数値をテキストファイル '{param_filename}' として保存しました。")
