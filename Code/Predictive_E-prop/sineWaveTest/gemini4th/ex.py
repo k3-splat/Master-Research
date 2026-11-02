@@ -347,7 +347,7 @@ class PredictiveEPropNet:
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
             
-            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias # + s_t
             
             self.lif.step(total_current[:self.cfg.n_lif])
             self.alif.step(total_current[self.cfg.n_lif:])
@@ -420,7 +420,7 @@ if __name__ == "__main__":
         print(f"  [Rate] Train: {firing_rates['training']:.2f} Hz | Error-driven: {firing_rates['error-driven']:.2f} Hz | Free-running: {firing_rates['free-running']:.2f} Hz")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs("outputnext", exist_ok=True)
+    os.makedirs("outputNext", exist_ok=True)
     
     # テンソルをCPU上のNumPy配列に変換
     t_all_np = t_all.cpu().numpy()

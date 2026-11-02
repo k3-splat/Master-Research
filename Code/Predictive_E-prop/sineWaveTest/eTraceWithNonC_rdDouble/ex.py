@@ -282,11 +282,6 @@ class PredictiveEPropNet:
 
         self.optimizer = EPropOptimizer(cfg=self.cfg, decay_r=self.lif.decay_r, decay_d=self.lif.decay_d, c_rd=self.lif.c_rd, device=device)
 
-        self.rec_z = None
-        self.rec_L = None
-        self.rec_e = None
-        self.rec_f = None
-
     def reset_state(self):
         self.lif.reset_state()
         self.alif.reset_state()
@@ -299,21 +294,16 @@ class PredictiveEPropNet:
         return self.s
 
     @torch.no_grad()
-    def run_full_epoch(self, target_signal, record=False):
+    def run_full_epoch(self, target_signal):
         self.reset_state()
 
         timesteps = len(target_signal)
         outputs = torch.zeros((timesteps, self.cfg.n_outputs), device=self.device, dtype=torch.float32)
+        fr_all = torch.zeros(timesteps, device=self.device, dtype=torch.float32)
 
         z_bar_prev = torch.zeros(self.cfg.n_neurons, device=self.device, dtype=torch.float32)
         z_bar_prev_prev = torch.zeros(self.cfg.n_neurons, device=self.device, dtype=torch.float32)
         psi_prev = torch.zeros(self.cfg.n_neurons, device=self.device, dtype=torch.float32)
-
-        if record:
-            self.rec_z = torch.zeros((timesteps, self.cfg.n_neurons), device=self.device, dtype=torch.bool)
-            self.rec_L = torch.zeros(timesteps, device=self.device, dtype=torch.float32)
-            self.rec_e = torch.zeros(timesteps, device=self.device, dtype=torch.float32)
-            self.rec_f = torch.zeros(timesteps, device=self.device, dtype=torch.float32)
 
         train_cutoff = self.cfg.training_phase
         error_cutoff = self.cfg.training_phase + self.cfg.error_driven_phase
@@ -343,6 +333,7 @@ class PredictiveEPropNet:
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
 
+            # ノイズを付与する場合はコメントアウトを外す
             s_t = self.generate_ou_noise()
 
             total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias # + s_t
@@ -350,18 +341,15 @@ class PredictiveEPropNet:
             self.lif.step(total_current[:self.cfg.n_lif])
             self.alif.step(total_current[self.cfg.n_lif:])
 
+            # ステップごとの平均発火率 (Hz) の記録
+            current_spikes = torch.cat([self.lif.z, self.alif.z])
+            fr_all[t] = torch.mean(current_spikes) * 1000.0
+
             if phase == "training":
                 L_t = self.B @ d_t
                 all_psi = torch.cat([self.lif.psi, self.alif.psi])
 
                 should_update = self.optimizer.update_traces_and_gradients(self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t)
-
-                if record:
-                    current_spikes = torch.cat([self.lif.z, self.alif.z])
-                    self.rec_z[t] = current_spikes > 0
-                    self.rec_L[t] = L_t[0]
-                    self.rec_e[t] = torch.mean(torch.abs(self.optimizer.e_trace))
-                    self.rec_f[t] = torch.mean(current_spikes) * 1000.0
 
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
@@ -372,27 +360,21 @@ class PredictiveEPropNet:
                 psi_prev = all_psi.clone()
 
             else:
-                if record:
-                    current_spikes = torch.cat([self.lif.z, self.alif.z])
-                    self.rec_z[t] = current_spikes > 0
+                self.optimizer.spike_buffer += current_spikes
+                self.optimizer.step_counter += 1
 
-                    self.optimizer.spike_buffer += current_spikes
-                    self.optimizer.step_counter += 1
+                if self.optimizer.step_counter >= self.optimizer.cfg.t_delay:
+                    self.optimizer.spike_buffer.zero_()
+                    self.optimizer.step_counter = 0
 
-                    if self.optimizer.step_counter >= self.optimizer.cfg.t_delay:
-                        self.optimizer.spike_buffer.zero_()
-                        self.optimizer.step_counter = 0
-
-                    self.rec_f[t] = torch.mean(current_spikes) * 1000.0
-
-        return outputs
+        return outputs, fr_all
 
 
 # ==========================================
 # タスク実行とグラフ描画
 # ==========================================
 if __name__ == "__main__":
-    # 設定クラスのインスタンス化 (ここで全てのハイパーパラメータを調整可能)
+    # 設定クラスのインスタンス化
     cfg = Config()
 
     t_all = np.arange(0, cfg.total_time, cfg.time_step_dt)
@@ -405,19 +387,25 @@ if __name__ == "__main__":
 
     net = PredictiveEPropNet(cfg=cfg, device=device)
 
-    out_all_torch = None
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs("output", exist_ok=True)
 
     len_train = cfg.training_phase
     len_error = cfg.error_driven_phase
 
+    # 各フェーズごとの平均発火率を記録するリスト
+    fr_train_list = []
+    fr_error_list = []
+    fr_free_list = []
+
+    out_all_torch = None
+
     for epoch in range(cfg.epochs):
         print(f"--- Epoch {epoch + 1}/{cfg.epochs} ---")
 
-        do_record = (epoch + 1) % 10 == 0
-        out_all_torch = net.run_full_epoch(target_all, record=do_record)
+        out_all_torch, fr_all_torch = net.run_full_epoch(target_all)
 
+        # 損失の計算
         loss_train = torch.mean((out_all_torch[:len_train] - target_all[:len_train]) ** 2).item()
         loss_error = torch.mean((out_all_torch[len_train:len_train + len_error] - target_all[len_train:len_train + len_error]) ** 2).item()
         loss_free = torch.mean((out_all_torch[len_train + len_error:] - target_all[len_train + len_error:]) ** 2).item()
@@ -426,45 +414,40 @@ if __name__ == "__main__":
         print(f"  Error-driven Loss: {loss_error:.5f}")
         print(f"  Free-running Loss: {loss_free:.5f}")
 
-        if do_record:
-            fig_analysis, axes_analysis = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+        # 平均発火率の計算と保存
+        fr_all_np = fr_all_torch.cpu().numpy()
+        fr_train_list.append(np.mean(fr_all_np[:len_train]))
+        fr_error_list.append(np.mean(fr_all_np[len_train:len_train + len_error]))
+        fr_free_list.append(np.mean(fr_all_np[len_train + len_error:]))
 
-            spikes = net.rec_z.cpu().numpy()
-            y_idx, x_idx = np.where(spikes.T)
 
-            axes_analysis[0].scatter(x_idx, y_idx, s=1, color="black", alpha=0.5)
-            axes_analysis[0].set_title(f"Spikes z (Epoch {epoch + 1})")
-            axes_analysis[0].set_ylabel("Neuron index")
+    # --- 発火率推移グラフ (Figure 2C 準拠) の描画と保存 ---
+    fig_fr, ax_fr = plt.subplots(figsize=(8, 5))
+    epochs_arr = np.arange(1, cfg.epochs + 1)
+    
+    # 論文に従ったカラーリング: Training(青), Error-driven(オレンジ), Free-running(緑)
+    ax_fr.plot(epochs_arr, fr_train_list, label='Training', color='blue', alpha=0.8)
+    ax_fr.plot(epochs_arr, fr_error_list, label='Error-driven', color='orange', alpha=0.8)
+    ax_fr.plot(epochs_arr, fr_free_list, label='Free-running', color='green', alpha=0.8)
 
-            axes_analysis[1].plot(t_all, net.rec_L.cpu().numpy(), color="blue")
-            axes_analysis[1].set_title("Learning Signal L (Neuron 0)")
-            axes_analysis[1].set_ylabel("L")
+    ax_fr.set_xlabel('Epoch')
+    ax_fr.set_ylabel('Firing Rate [Hz]')
+    ax_fr.set_title('Average Firing Rate Evolution')
+    ax_fr.grid(True, alpha=0.3)
+    ax_fr.legend(loc='lower right')
 
-            axes_analysis[2].plot(t_all, net.rec_e.cpu().numpy(), color="red")
-            axes_analysis[2].set_title("Eligibility Trace e (Mean Absolute Value)")
-            axes_analysis[2].set_ylabel("e")
+    plt.tight_layout()
+    fr_filename = f"output/predictive_eprop_firing_rate_{timestamp}.png"
+    plt.savefig(fr_filename)
+    plt.close(fig_fr)
+    print(f"発火率の推移プロットを画像ファイル '{fr_filename}' として保存しました。")
 
-            window = 100
-            smoothed_f = np.convolve(net.rec_f.cpu().numpy(), np.ones(window) / window, mode="same")
 
-            axes_analysis[3].plot(t_all, smoothed_f, color="green")
-            axes_analysis[3].set_title("Mean Firing Rate (100ms Moving Average)")
-            axes_analysis[3].set_xlabel("Time [ms]")
-            axes_analysis[3].set_ylabel("Hz")
-
-            plt.tight_layout()
-
-            analysis_filename = f"output/analysis_epoch_{epoch + 1}_{timestamp}.png"
-            plt.savefig(analysis_filename)
-            plt.close(fig_analysis)
-
-            print(f"  => 内部状態のプロットを '{analysis_filename}' に保存しました。")
-
+    # --- 推論結果 (最終エポックの出力波形) の描画と保存 ---
     out_all = out_all_torch.cpu().numpy()
     target_all = target_all_np
 
     img_filename = f"output/predictive_eprop_result_{timestamp}.png"
-
     fig, axes = plt.subplots(3, 1, figsize=(10, 8))
 
     axes[0].plot(t_all[:len_train], target_all[:len_train], label="Target", color="black", linestyle="--")
@@ -488,10 +471,11 @@ if __name__ == "__main__":
 
     plt.tight_layout()
     plt.savefig(img_filename)
+    plt.close(fig)
+    print(f"推論結果のプロットを画像ファイル '{img_filename}' として保存しました。")
 
-    print(f"\n推論結果のプロットを画像ファイル '{img_filename}' として保存しました。")
 
-    # ハイパーパラメータ一覧のテキスト出力 (Configから自動生成)
+    # --- ハイパーパラメータ一覧のテキスト出力 ---
     param_filename = f"output/predictive_eprop_params_{timestamp}.txt"
     actual_params = asdict(cfg)
 

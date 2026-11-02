@@ -295,7 +295,7 @@ class PredictiveEPropNet:
                 i_in = self.w_in @ d_t
                 i_fb = self.w_fb @ y_t
                 
-                total_current = xi * i_in + i_rec + i_fb + self.p.I_bias # + s_t
+                total_current = xi * i_in + i_rec + i_fb + self.p.I_bias + s_t
                 
                 self.layer.step(total_current)
                 
