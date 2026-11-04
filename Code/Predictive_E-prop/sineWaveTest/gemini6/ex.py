@@ -39,7 +39,7 @@ class Config:
     t_ref: float = 5.0
     gamma_d: float = 0.3
     tau_alif: float = 2000.0
-    beta_alif: float = 0.0174
+    beta_alif: float = 0.01
     I_bias: float = 0.02
     
     # ノイズ (OUプロセス)[cite: 76]
@@ -282,12 +282,8 @@ class PredictiveEPropNet:
         self.s.zero_()
 
     def generate_ou_noise(self):
-        decay = torch.exp(torch.tensor(-self.cfg.dt / self.cfg.tau_s, device=self.device))
-        self.s = (
-            self.cfg.mu_s
-            + (self.s - self.cfg.mu_s) * decay
-            + self.cfg.sigma_s * (self.cfg.dt / self.cfg.tau_s) * torch.randn(self.n_neurons, device=self.device)
-        )
+        theta = self.cfg.dt / self.cfg.tau_s
+        self.s = self.s + (self.cfg.mu_s - self.s) * theta + self.cfg.sigma_s * theta * torch.randn(self.n_neurons, device=self.device)
         return self.s
 
     def run_full_epoch(self, target_signal):

@@ -32,7 +32,7 @@ class EPropConfig:
     gamma_d: float = 0.3
     t_ref: float = 5.0
     tau_alif: float = 2000.0
-    beta: float = 0.0174
+    beta: float = 1.0
     
     # ネットワーク結合パラメータ
     g: float = 150.0
@@ -304,8 +304,8 @@ class PredictiveEPropNet:
 
     def generate_ou_noise(self):
         decay = math.exp(-self.cfg.dt / self.cfg.tau_s)
-        self.s = self.cfg.mu_s + (self.s - self.cfg.mu_s) * decay + \
-                 self.cfg.sigma_s * (self.cfg.dt / self.cfg.tau_s) * torch.randn(self.cfg.n_neurons, device=device)
+        # self.s = self.cfg.mu_s + (self.s - self.cfg.mu_s) * decay + self.cfg.sigma_s * (self.cfg.dt / self.cfg.tau_s) * torch.randn(self.cfg.n_neurons, device=device)
+        self.s = self.cfg.mu_s + (self.s - self.cfg.mu_s) * decay + self.cfg.sigma_s * math.sqrt(1.0 - decay ** 2) * torch.randn(self.cfg.n_neurons, device=device)
         return self.s
 
     @torch.no_grad()
@@ -347,7 +347,7 @@ class PredictiveEPropNet:
             i_in = self.w_in @ d_t
             i_fb = self.w_fb @ y_t
             
-            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias # + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias + s_t
             
             self.lif.step(total_current[:self.cfg.n_lif])
             self.alif.step(total_current[self.cfg.n_lif:])

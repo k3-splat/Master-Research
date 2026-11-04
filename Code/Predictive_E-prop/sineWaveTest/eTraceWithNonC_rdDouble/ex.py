@@ -48,7 +48,7 @@ class Config:
     I_bias: float = 0.02
     tau_mem: float = 20.0
     tau_alif: float = 2000.0
-    beta: float = 0.0174
+    beta: float = 0.3
     tau_r: float = 50.0
     tau_d: float = 125.0
     t_ref: float = 5.0
@@ -56,7 +56,7 @@ class Config:
 
     # OUノイズパラメータ
     tau_s: float = 250.0
-    sigma_s: float = 1.0
+    sigma_s: float = 0.1
     mu_s: float = 0.0
 
     # 実行設定
@@ -104,6 +104,7 @@ class BaseNeuronGroup:
         self.psi = (self.cfg.gamma_d / self.cfg.v_th) * torch.clamp(1.0 - torch.abs((v_next_raw - b_next) / self.cfg.v_th), min=0.0)
 
         is_currently_refractory = self.ref_counts > 0
+        self.psi[is_currently_refractory] = 0.0
         spike_cond = (v_next_raw > b_next) & (~is_currently_refractory)
         self.z = spike_cond.float()
 
@@ -289,8 +290,10 @@ class PredictiveEPropNet:
         self.s.zero_()
 
     def generate_ou_noise(self):
-        decay = float(np.exp(-self.cfg.time_step_dt / self.cfg.tau_s))
-        self.s = self.cfg.mu_s + (self.s - self.cfg.mu_s) * decay + self.cfg.sigma_s * (self.cfg.time_step_dt / self.cfg.tau_s) * torch.randn(self.cfg.n_neurons, device=self.device, dtype=torch.float32)
+        # decay = float(np.exp(-self.cfg.time_step_dt / self.cfg.tau_s))
+        theta = self.cfg.time_step_dt / self.cfg.tau_s
+        self.s = self.s + (self.cfg.mu_s - self.s) * theta + self.cfg.sigma_s * theta * torch.randn(self.cfg.n_neurons, device=self.device, dtype=torch.float32)
+        # self.s = self.cfg.mu_s + (self.s - self.cfg.mu_s) * decay + self.cfg.sigma_s * np.sqrt(1.0 - decay ** 2) * torch.randn(self.cfg.n_neurons, device=self.device, dtype=torch.float32)
         return self.s
 
     @torch.no_grad()
@@ -336,7 +339,7 @@ class PredictiveEPropNet:
             # ノイズを付与する場合はコメントアウトを外す
             s_t = self.generate_ou_noise()
 
-            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias # + s_t
+            total_current = xi * i_in + i_rec + i_fb + self.cfg.I_bias + s_t
 
             self.lif.step(total_current[:self.cfg.n_lif])
             self.alif.step(total_current[self.cfg.n_lif:])

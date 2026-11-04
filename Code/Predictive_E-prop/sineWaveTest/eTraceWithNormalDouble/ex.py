@@ -27,7 +27,7 @@ class EPropParams:
     # ニューロンモデル関連
     v_th: float = 0.6
     gamma_d: float = 0.3
-    beta_alif: float = 0.0174
+    beta_alif: float = 0.05
     
     # ネットワーク構造・ノイズ関連
     g: float = 150.0
@@ -245,12 +245,14 @@ class PredictiveEPropNet:
     def generate_ou_noise_tensor(self, timesteps: int) -> torch.Tensor:
         """GPU上で全ステップのOUノイズを事前生成"""
         decay = math.exp(-self.p.dt / self.p.tau_s)
+        theta = self.p.dt / self.p.tau_s
         noise = torch.randn(timesteps, self.N, device=self.device)
         s = torch.zeros(self.N, device=self.device)
         
         s_history = torch.empty(timesteps, self.N, device=self.device)
         for t in range(timesteps):
-            s = self.p.mu_s + (s - self.p.mu_s) * decay + self.p.sigma_s * (self.p.dt / self.p.tau_s) * noise[t]
+            s = s + (self.p.mu_s - s) * theta + self.p.sigma_s * theta * noise[t]
+            # s = self.p.mu_s + (s - self.p.mu_s) * decay + self.p.sigma_s * math.sqrt(1.0 - decay ** 2) * noise[t]
             s_history[t] = s
         return s_history
 
