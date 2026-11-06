@@ -3,3 +3,4 @@
 LaTeX/*
 !LaTeX/*.pdf
 /xmlOfRepositories
+/TIMIT
