@@ -6,7 +6,7 @@ import numpy as np
 import datetime
 import os
 import pickle
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 # デバイス設定
 device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
@@ -37,7 +37,7 @@ class Config:
     density: float = 0.2
 
     # CTCパラメータ
-    n_phonemes_out: int = 62 # 61音素 + 1 blank
+    n_phonemes_out: int = 40 # 39音素 + 1 blank
     blank_id: int = 0
 
     # ニューロン・シナプスダイナミクス
@@ -59,12 +59,13 @@ class Config:
 
     # 実行設定
     stage1_epochs: int = 5
-    stage2_epochs: int = 10
+    stage2_epochs: int = 30
     beam_width: int = 100
     
     # データパス設定
-    features_pickle_path: str = "filter_banks.pickle"  # 音響特徴量 (123次元)
-    targets_pickle_path: str = "reduced_phonems.pickle"  # 正解音素ラベル
+    data_base_dir: str = "/home/keitaro-sunagawa/Master-Research/TIMIT" # 実際のディレクトリ構造に合わせて変更してください
+    features_pickle_name: str = "filter_banks.pickle"
+    targets_pickle_name: str = "reduced_phonems.pickle"
 
     @property
     def n_neurons(self) -> int:
@@ -72,31 +73,16 @@ class Config:
 
 
 # ==========================================
-# 2. TIMIT 61 -> 39 音素マッピング
+# 2. 音素リスト定義 (Encoder と完全に同期)
 # ==========================================
-# TIMITの標準的な61音素を39音素クラスへ縮約するマッピングテーブル (ブランクは0を想定し、音素は1〜61のインデックスとする)
-TIMIT_61_TO_39_MAP = {
-    'aa': 'aa', 'ao': 'aa', 'ah': 'ah', 'ax': 'ah', 'ax-h': 'ah',
-    'er': 'er', 'axr': 'er', 'hh': 'hh', 'hv': 'hh', 'ih': 'ih', 'ix': 'ih',
-    'l': 'l', 'el': 'l', 'm': 'm', 'em': 'm', 'n': 'n', 'en': 'n', 'nx': 'n',
-    'ng': 'ng', 'eng': 'ng', 'sh': 'sh', 'zh': 'sh',
-    'pcl': 'sil', 'tcl': 'sil', 'kcl': 'sil', 'bcl': 'sil', 'dcl': 'sil', 'gcl': 'sil',
-    'h#': 'sil', 'pau': 'sil', 'epi': 'sil', 'q': 'sil',
-    'uw': 'uw', 'ux': 'uw'
-}
-
-PHONEME_LIST = ['<blank>'] + [
-    'aa', 'ae', 'ah', 'ao', 'aw', 'ax', 'ax-h', 'axr', 'ay', 'b', 'bcl', 'ch', 'd', 'dcl', 'dh', 'dx', 'eh', 'el', 'em', 'en', 
-    'eng', 'epi', 'er', 'ey', 'f', 'g', 'gcl', 'h#', 'hh', 'hv', 'ih', 'ix', 'iy', 'jh', 'k', 'kcl', 'l', 'm', 'n', 'ng', 'nx', 
-    'ow', 'oy', 'p', 'pau', 'pcl', 'q', 'r', 's', 'sh', 't', 'tcl', 'th', 'uh', 'uw', 'ux', 'v', 'w', 'y', 'z', 'zh'
+# Encoder側ですでに39音素に縮約済みのため、マッピング処理は不要
+PHONEME_LIST = [
+    '<blank>', 'sil', 'aa', 'ae', 'ah', 'aw', 'ay', 'b', 'ch', 'd', 'dh', 'dx', 'eh', 'er',
+    'ey', 'f', 'g', 'hh', 'ih', 'iy', 'jh', 'k', 'l', 'm', 'n', 'ng', 'ow', 'oy',
+    'p', 'r', 's', 'sh', 't', 'th', 'uh', 'uw', 'v', 'w', 'y', 'z'
 ]
 PHONEME_TO_ID = {p: i for i, p in enumerate(PHONEME_LIST)}
 ID_TO_PHONEME = {i: p for p, i in PHONEME_TO_ID.items()}
-
-def map_phoneme_to_39(phn_str):
-    if phn_str in TIMIT_61_TO_39_MAP:
-        return TIMIT_61_TO_39_MAP[phn_str]
-    return phn_str
 
 
 # ==========================================
@@ -332,11 +318,6 @@ class CTCDecoder(nn.Module):
 # 5. Utils (データロード, PER評価 & ビームサーチ)
 # ==========================================
 def load_pickle_dataset(feature_path, target_path):
-    """
-    TIMIT processing scriptで生成されたpickleファイルを読み込む。
-    features: List of (T, N_features) numpy arrays
-    targets: List of (T,) numpy arrays or lists containing phoneme IDs
-    """
     if not os.path.exists(feature_path) or not os.path.exists(target_path):
         raise FileNotFoundError(f"Pickle files not found: {feature_path} or {target_path}. "
                                 f"Please ensure the data has been processed and paths are correct.")
@@ -391,17 +372,18 @@ def ctc_beam_search_decoder(probs_np, beam_width, blank=0):
     return list(best_path)
 
 def compute_per(ref_phns, hyp_phns):
-    ref_39 = [map_phoneme_to_39(ID_TO_PHONEME[i]) for i in ref_phns if i != 0]
-    hyp_39 = [map_phoneme_to_39(ID_TO_PHONEME[i]) for i in hyp_phns if i != 0]
+    # すでに39音素に縮約済みの為、文字列として直接編集距離を比較
+    ref_str = [ID_TO_PHONEME[i] for i in ref_phns if i != 0]
+    hyp_str = [ID_TO_PHONEME[i] for i in hyp_phns if i != 0]
     
-    m, n = len(ref_39), len(hyp_39)
+    m, n = len(ref_str), len(hyp_str)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(m + 1): dp[i][0] = i
     for j in range(n + 1): dp[0][j] = j
     
     for i in range(1, m + 1):
         for j in range(1, n + 1):
-            if ref_39[i - 1] == hyp_39[j - 1]:
+            if ref_str[i - 1] == hyp_str[j - 1]:
                 dp[i][j] = dp[i - 1][j - 1]
             else:
                 dp[i][j] = min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]) + 1
@@ -415,30 +397,39 @@ if __name__ == '__main__':
     cfg = Config()
     
     # --- 1. Pickleファイルからデータをロード ---
-    print("\n[Init] Loading acoustic features and targets from pickle files...")
+    print(f"\n[Init] Loading acoustic features and targets from base directory '{cfg.data_base_dir}'...")
+    
+    train_features_path = os.path.join(cfg.data_base_dir, "train_pickle", cfg.features_pickle_name)
+    train_targets_path = os.path.join(cfg.data_base_dir, "train_pickle", cfg.targets_pickle_name)
+    test_features_path = os.path.join(cfg.data_base_dir, "test_pickle", cfg.features_pickle_name)
+    test_targets_path = os.path.join(cfg.data_base_dir, "test_pickle", cfg.targets_pickle_name)
+
     try:
-        features_list, targets_list = load_pickle_dataset(cfg.features_pickle_path, cfg.targets_pickle_path)
+        train_feat_list, train_tgt_list = load_pickle_dataset(train_features_path, train_targets_path)
+        test_feat_list, test_tgt_list = load_pickle_dataset(test_features_path, test_targets_path)
         
-        # 訓練データとテストデータに分割 (最初のシーケンスを訓練用、2つ目をテスト用として抽出)
-        if len(features_list) >= 2:
-            train_input_np = np.array(features_list[0], dtype=np.float32)
-            train_target_np = np.array(targets_list[0], dtype=np.int64)
-            test_input_np = np.array(features_list[1], dtype=np.float32)
-            test_target_np = np.array(targets_list[1], dtype=np.int64)
-            print("Successfully split data into train and test sequences.")
-        else:
-            print("Warning: Only 1 sequence found. Using it for both training and testing.")
-            train_input_np = test_input_np = np.array(features_list[0], dtype=np.float32)
-            train_target_np = test_target_np = np.array(targets_list[0], dtype=np.int64)
-            
+        # デモンストレーションのため、最初のシーケンスを抽出
+        train_input_np = np.array(train_feat_list[0], dtype=np.float32)
+        
+        # 【修正】以前のエンコーダ出力との整合性を取るため、ターゲットID全体に +1 をしてシフトさせる
+        train_target_np = np.array(train_tgt_list[0], dtype=np.int64) + 1
+        
+        test_input_np = np.array(test_feat_list[0], dtype=np.float32)
+        
+        # 【修正】こちらも +1 をする
+        test_target_np = np.array(test_tgt_list[0], dtype=np.int64) + 1
+        
         train_target_np = process_target_sequence(train_target_np)
         test_target_np = process_target_sequence(test_target_np)
+        print("Successfully loaded train and test sequences from directories.")
 
     except FileNotFoundError as e:
         print(e)
         print("Using dummy data instead to demonstrate the pipeline...")
-        train_input_np = test_input_np = np.random.randn(500, cfg.n_inputs).astype(np.float32) * 0.5 + 1.0
-        train_target_np = test_target_np = np.random.randint(1, cfg.n_phonemes_out, (15,), dtype=np.int64)
+        train_input_np = np.random.randn(500, cfg.n_inputs).astype(np.float32) * 0.5 + 1.0
+        test_input_np = np.random.randn(400, cfg.n_inputs).astype(np.float32) * 0.5 + 1.0
+        train_target_np = np.random.randint(1, cfg.n_phonemes_out, (15,), dtype=np.int64)
+        test_target_np = np.random.randint(1, cfg.n_phonemes_out, (12,), dtype=np.int64)
 
     train_seq_len = train_input_np.shape[0]
     test_seq_len = test_input_np.shape[0]
@@ -486,7 +477,7 @@ if __name__ == '__main__':
         z_bar_bar_seq = z_bar_bar_seq.unsqueeze(1) 
         
         optimizer.zero_grad()
-        log_probs = decoder(z_bar_bar_seq) # [T, 1, 62]
+        log_probs = decoder(z_bar_bar_seq) # [T, 1, 40]
         
         loss = ctc_loss_fn(log_probs, train_target_tensor.unsqueeze(0), train_input_lengths, train_target_lengths)
         loss.backward()
@@ -513,8 +504,7 @@ if __name__ == '__main__':
     per = compute_per(ref_path, hyp_path)
     
     print("\n=== Evaluation Results (Test Data) ===")
-    print(f"  Reference (Original)   : {[ID_TO_PHONEME[i] for i in ref_path]}")
-    print(f"  Reference (39-reduced) : {[map_phoneme_to_39(ID_TO_PHONEME[i]) for i in ref_path]}")
-    print(f"  Hypothesis (39-reduced): {[map_phoneme_to_39(ID_TO_PHONEME[i]) for i in hyp_path if i != 0]}")
+    print(f"  Reference              : {[ID_TO_PHONEME[i] for i in ref_path]}")
+    print(f"  Hypothesis             : {[ID_TO_PHONEME[i] for i in hyp_path if i != 0]}")
     print(f"  Phoneme Error Rate(PER): {per * 100:.2f}%")
     print("======================================")
