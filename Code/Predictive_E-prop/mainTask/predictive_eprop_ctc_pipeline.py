@@ -34,8 +34,8 @@ class Config:
     # ネットワーク構造
     n_inputs: int = 123     # filter_banks.pickle の次元数 (41 * 3 = 123次元)
     n_outputs: int = 123    # 予測ターゲットも同じ次元数
-    n_lif: int = 100
-    n_alif: int = 200
+    n_lif: int = 100        
+    n_alif: int = 300       # 表現力確保のため ALIF を多めに配置
     density: float = 0.2
 
     # CTCパラメータ
@@ -63,7 +63,7 @@ class Config:
     stage1_epochs: int = 60
     stage2_epochs: int = 30
     beam_width: int = 100
-    batch_size: int = 8      # 【追加】バッチサイズ
+    batch_size: int = 8      
     
     # データパス設定
     data_base_dir: str = "/home/keitaro-sunagawa/Master-Research/TIMIT" # 環境に合わせて変更
@@ -101,7 +101,6 @@ class BaseNeuronGroup:
         self.c_rd = 1.0 / (cfg.tau_r * cfg.tau_d)
         
     def reset_state(self, batch_size):
-        # テンソルにバッチ次元 (batch_size, n_neurons) を追加
         self.v = torch.zeros(batch_size, self.n, device=self.device)
         self.z = torch.zeros(batch_size, self.n, device=self.device)
         self.z_bar = torch.zeros(batch_size, self.n, device=self.device)
@@ -122,7 +121,6 @@ class BaseNeuronGroup:
         self.ref_counts = torch.clamp(self.ref_counts - self.cfg.time_step_dt, min=0.0)
         self.ref_counts = torch.where(self.z > 0, torch.tensor(self.cfg.t_ref, device=self.device), self.ref_counts)
 
-        # ダブル指数フィルタの更新
         self.z_bar_bar = self.decay_d * self.z_bar_bar + self.q
         self.q = self.decay_r * self.q + self.c_rd * self.z
         self.z_bar = self.alpha * self.z_bar + self.z_bar_bar
@@ -169,19 +167,20 @@ class EPropOptimizer:
         n = self.cfg.n_neurons
         o = self.cfg.n_outputs
         
-        # トレースにバッチ次元 (Batch, Post, Pre) を追加
         self.e_trace = torch.zeros((batch_size, n, n), device=self.device)
         self.eps_b = torch.zeros((batch_size, n, n), device=self.device)
         self.q = torch.zeros((batch_size, n, n), device=self.device)
         self.e_bar_bar = torch.zeros((batch_size, n, n), device=self.device)
+        
+        # チャンク用の蓄積バッファ
         self.e_trace_sum_t_delays = torch.zeros((batch_size, n, n), device=self.device)
         self.spike_buffer = torch.zeros((batch_size, n), device=self.device)
+        self.grad_w_rec_chunk = torch.zeros((n, n), device=self.device)
+        self.grad_w_out_chunk = torch.zeros((o, n), device=self.device)
         
-        # 勾配はバッチで平均を取って蓄積するため (Post, Pre)
-        self.grad_w_rec = torch.zeros((n, n), device=self.device)
-        self.grad_w_out = torch.zeros((o, n), device=self.device)
-        self.grad_w_rec_accumulated = torch.zeros((n, n), device=self.device)
-        self.grad_w_out_accumulated = torch.zeros((o, n), device=self.device)
+        # シーケンス全体用の総勾配蓄積バッファ（ここでシーケンス最後まで溜め込む）
+        self.total_grad_w_rec = torch.zeros((n, n), device=self.device)
+        self.total_grad_w_out = torch.zeros((o, n), device=self.device)
         
         self.step_counter = 0
 
@@ -190,7 +189,6 @@ class EPropOptimizer:
             offset = 0 if idx == 0 else neurons[0].n
             n_g, beta, rho = g.n, g.beta, getattr(g, "rho", 0.0)
             
-            # shape変換: (Batch, Neurons) -> (Batch, Neurons, 1)
             psi_curr = g.psi.unsqueeze(2) 
             psi_prev_g = psi_prev[:, offset:offset + n_g].unsqueeze(2)
 
@@ -201,44 +199,48 @@ class EPropOptimizer:
         self.e_bar_bar = self.decay_d * self.e_bar_bar + self.q
         self.q = self.decay_r * self.q + self.e_trace
 
-        # 有効なシーケンス（mask_t==1）のみ勾配を計算してバッチ平均をとる
-        grad_rec_step = (L_t.unsqueeze(2) * self.e_bar_bar) * mask_t.unsqueeze(2) # (B, n, n)
-        self.grad_w_rec_accumulated += grad_rec_step.mean(dim=0)
+        # チャンク用の勾配蓄積
+        grad_rec_step = (L_t.unsqueeze(2) * self.e_bar_bar) * mask_t.unsqueeze(2)
+        self.grad_w_rec_chunk += grad_rec_step.mean(dim=0)
         
-        grad_out_step = torch.bmm(error_t.unsqueeze(2), z_bar_curr.unsqueeze(1)) * mask_t.unsqueeze(2) # (B, o, n)
-        self.grad_w_out_accumulated += grad_out_step.mean(dim=0)
+        grad_out_step = torch.bmm(error_t.unsqueeze(2), z_bar_curr.unsqueeze(1)) * mask_t.unsqueeze(2)
+        self.grad_w_out_chunk += grad_out_step.mean(dim=0)
 
-        # マスクをかけてスパイクバッファと遅延トレースを更新
         self.spike_buffer += torch.cat([g.z for g in neurons], dim=1) * mask_t
         self.e_trace_sum_t_delays += self.e_trace * mask_t.unsqueeze(2)
         self.step_counter += 1
 
+        # t_delayステップごとに正則化項を計算し、総勾配に合流させる
         if self.step_counter >= self.cfg.t_delay:
-            self.grad_w_rec = self.grad_w_rec_accumulated.clone()
-            self.grad_w_out = self.grad_w_out_accumulated.clone()
-            
             f_bar = self.spike_buffer.mean(dim=0) / self.cfg.t_delay
             reg_signal = (self.cfg.lambda_reg / self.cfg.t_delay) * (f_bar - self.cfg.f_star)
-            self.grad_w_rec += reg_signal.unsqueeze(1) * self.e_trace_sum_t_delays.mean(dim=0)
-
+            
+            self.grad_w_rec_chunk += reg_signal.unsqueeze(1) * self.e_trace_sum_t_delays.mean(dim=0)
+            
+            # 総勾配へ加算
+            self.total_grad_w_rec += self.grad_w_rec_chunk
+            self.total_grad_w_out += self.grad_w_out_chunk
+            
+            # チャンクバッファをリセット
             self.spike_buffer.zero_()
             self.e_trace_sum_t_delays.zero_()
-            self.grad_w_rec_accumulated.zero_()
-            self.grad_w_out_accumulated.zero_()
+            self.grad_w_rec_chunk.zero_()
+            self.grad_w_out_chunk.zero_()
             self.step_counter = 0
-            return True
-        return False
 
-    def apply_weight_update(self, w_rec, w_out):
-        w_rec -= self.cfg.eta_rec * self.grad_w_rec + self.cfg.eta_rec * (2.0 * self.cfg.lambda_w) * w_rec
-        w_out -= self.cfg.eta_out * self.grad_w_out + self.cfg.eta_out * (2.0 * self.cfg.lambda_w) * w_out
-        self.grad_w_rec.zero_()
-        self.grad_w_out.zero_()
-        return w_rec, w_out
+    def finalize_sequence(self):
+        # シーケンスの終端で端数（t_delayに満たないステップ）の勾配を合流させる
+        if self.step_counter > 0:
+            f_bar = self.spike_buffer.mean(dim=0) / self.step_counter
+            reg_signal = (self.cfg.lambda_reg / self.cfg.t_delay) * (f_bar - self.cfg.f_star)
+            self.grad_w_rec_chunk += reg_signal.unsqueeze(1) * self.e_trace_sum_t_delays.mean(dim=0)
+            self.total_grad_w_rec += self.grad_w_rec_chunk
+            self.total_grad_w_out += self.grad_w_out_chunk
 
 
-class PredictiveEPropNet:
+class PredictiveEPropNet(nn.Module):
     def __init__(self, cfg: Config, device=device):
+        super().__init__()
         self.cfg = cfg
         self.device = device
         self.lif = LIFGroup(cfg.n_lif, cfg=cfg, device=device)
@@ -247,25 +249,26 @@ class PredictiveEPropNet:
 
         self.w_in = torch.randn(cfg.n_neurons, cfg.n_inputs, device=device) / np.sqrt(cfg.g)
         self.w_fb = torch.randn(cfg.n_neurons, cfg.n_outputs, device=device) / np.sqrt(cfg.g)
+        
         self.w_rec_mask = (torch.rand(cfg.n_neurons, cfg.n_neurons, device=device) < cfg.density).float()
         self.w_rec_mask.fill_diagonal_(0.0)
-        self.w_rec = (torch.randn(cfg.n_neurons, cfg.n_neurons, device=device) / np.sqrt(cfg.n_neurons)) * self.w_rec_mask
-        self.w_out = torch.randn(cfg.n_outputs, cfg.n_neurons, device=device) / np.sqrt(cfg.n_neurons)
+        
+        self.w_rec = nn.Parameter((torch.randn(cfg.n_neurons, cfg.n_neurons, device=device) / np.sqrt(cfg.n_neurons)) * self.w_rec_mask)
+        self.w_out = nn.Parameter(torch.randn(cfg.n_outputs, cfg.n_neurons, device=device) / np.sqrt(cfg.n_neurons))
+        
         self.B = torch.randn(cfg.n_neurons, cfg.n_outputs, device=device) / np.sqrt(cfg.n_neurons)
 
-        self.optimizer = EPropOptimizer(cfg=self.cfg, decay_r=self.lif.decay_r, decay_d=self.lif.decay_d, c_rd=self.lif.c_rd, device=device)
+        self.eprop_tracker = EPropOptimizer(cfg=self.cfg, decay_r=self.lif.decay_r, decay_d=self.lif.decay_d, c_rd=self.lif.c_rd, device=device)
         self.requires_grad = True
 
     def reset_state(self, batch_size):
         self.s = torch.zeros(batch_size, self.cfg.n_neurons, device=self.device)
         self.lif.reset_state(batch_size)
         self.alif.reset_state(batch_size)
-        self.optimizer.reset_traces(batch_size)
+        self.eprop_tracker.reset_traces(batch_size)
 
     @torch.no_grad()
-    def run_forward(self, inputs, mask):
-        # inputs: (Time, Batch, Features)
-        # mask: (Time, Batch)
+    def run_forward(self, inputs, mask, adam_optimizer=None):
         timesteps, batch_size, _ = inputs.shape
         self.reset_state(batch_size)
         
@@ -277,32 +280,30 @@ class PredictiveEPropNet:
         psi_prev = torch.zeros(batch_size, self.cfg.n_neurons, device=self.device)
 
         for t in range(timesteps):
-            x_t = inputs[t]             # (Batch, Features)
-            m_t = mask[t].unsqueeze(1)  # (Batch, 1)
+            x_t = inputs[t]             
+            m_t = mask[t].unsqueeze(1)  
 
             all_z_bar_bar = torch.cat([self.lif.z_bar_bar, self.alif.z_bar_bar], dim=1)
             all_z_bar = torch.cat([self.lif.z_bar, self.alif.z_bar], dim=1)
 
             z_bar_bar_seq[t] = all_z_bar_bar
 
-            # 行列積をバッチ対応 (z @ W.T) に変更
             y_t = all_z_bar_bar @ self.w_out.T
             outputs[t] = y_t
-            d_t = (y_t - x_t) * m_t  # 予測誤差（マスク適用）
+            d_t = (y_t - x_t) * m_t  
 
             i_rec = all_z_bar_bar @ self.w_rec.T
             i_in = d_t @ self.w_in.T
             i_fb = y_t @ self.w_fb.T
             
+            # OUノイズを加えてネットワークの探索（発火）を促進
             theta = self.cfg.time_step_dt / self.cfg.tau_s
             self.s = self.s + (self.cfg.mu_s - self.s) * theta + self.cfg.sigma_s * theta * torch.randn(batch_size, self.cfg.n_neurons, device=self.device)
-
             total_current = i_in + i_rec + i_fb + self.cfg.I_bias # + self.s
 
             self.lif.step(total_current[:, :self.cfg.n_lif])
             self.alif.step(total_current[:, self.cfg.n_lif:])
             
-            # マスクの適用（シーケンス終了後はスパイクを抑制）
             self.lif.z *= m_t
             self.alif.z *= m_t
 
@@ -310,21 +311,34 @@ class PredictiveEPropNet:
                 L_t = d_t @ self.B.T
                 all_psi = torch.cat([self.lif.psi, self.alif.psi], dim=1)
                 
-                should_update = self.optimizer.update_traces_and_gradients(
+                self.eprop_tracker.update_traces_and_gradients(
                     self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t, m_t
                 )
-                
-                if should_update:
-                    self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
-                    self.w_rec *= self.w_rec_mask
 
                 z_bar_prev_prev = z_bar_prev.clone()
                 z_bar_prev = all_z_bar.clone()
                 psi_prev = all_psi.clone()
 
-        # パディング部分を無視したMSE計算
+        # --- シーケンス終了後に1回だけAdamを更新する ---
+        if self.requires_grad and (adam_optimizer is not None):
+            self.eprop_tracker.finalize_sequence()
+            
+            self.w_rec.grad = self.eprop_tracker.total_grad_w_rec.clone()
+            self.w_out.grad = self.eprop_tracker.total_grad_w_out.clone()
+            
+            # Weight Decay (L2正則化)
+            self.w_rec.grad += (2.0 * self.cfg.lambda_w) * self.w_rec.data
+            self.w_out.grad += (2.0 * self.cfg.lambda_w) * self.w_out.data
+            
+            adam_optimizer.step()
+            adam_optimizer.zero_grad()
+            
+            # 自己結合なし・疎結合のマスクを適用して構造を維持
+            self.w_rec.data *= self.w_rec_mask
+
         mse_loss = torch.sum(((outputs - inputs) ** 2) * mask.unsqueeze(2)) / (mask.sum() * self.cfg.n_outputs)
         return outputs, z_bar_bar_seq, mse_loss.item()
+
 
 # ==========================================
 # 4. CTCデコーダモジュール (Stage 2 用)
@@ -366,7 +380,6 @@ class TimitDataset(Dataset):
 
     def __getitem__(self, idx):
         feat = torch.tensor(self.features[idx], dtype=torch.float32)
-        # IDを+1シフトして連続重複を削除
         tgt = np.array(self.targets[idx], dtype=np.int64) + 1
         tgt = process_target_sequence(tgt)
         label = torch.tensor(tgt, dtype=torch.long)
@@ -377,13 +390,10 @@ def collate_fn(batch):
     lengths = torch.tensor([f.size(0) for f in features], dtype=torch.long)
     target_lengths = torch.tensor([l.size(0) for l in labels], dtype=torch.long)
     
-    # バッチの最大長に合わせてパディング
-    padded_features = nn.utils.rnn.pad_sequence(features, batch_first=False, padding_value=0.0) # (Time, Batch, Features)
-    padded_labels = nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=0) # (Batch, TargetLen)
+    padded_features = nn.utils.rnn.pad_sequence(features, batch_first=False, padding_value=0.0)
+    padded_labels = nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=0)
     
-    # マスクの作成 (Time, Batch)
     max_len = padded_features.size(0)
-    batch_size = len(features)
     mask = torch.arange(max_len).unsqueeze(1) < lengths.unsqueeze(0)
     
     return padded_features.to(device), padded_labels.to(device), lengths.to(device), target_lengths.to(device), mask.float().to(device)
@@ -441,7 +451,7 @@ def compute_per(ref_phns, hyp_phns):
 
 
 # ==========================================
-# 6. メインパイプライン (ミニバッチ学習対応)
+# 6. メインパイプライン
 # ==========================================
 if __name__ == '__main__':
     cfg = Config()
@@ -456,11 +466,9 @@ if __name__ == '__main__':
     train_feat_list, train_tgt_list = load_pickle_dataset(train_features_path, train_targets_path)
     test_feat_list, test_tgt_list = load_pickle_dataset(test_features_path, test_targets_path)
 
-    # 入力次元数の動的設定
     cfg.n_inputs = train_feat_list[0].shape[1]
     cfg.n_outputs = train_feat_list[0].shape[1]
 
-    # DataLoaderの作成
     train_dataset = TimitDataset(train_feat_list, train_tgt_list)
     test_dataset = TimitDataset(test_feat_list, test_tgt_list)
     
@@ -472,10 +480,12 @@ if __name__ == '__main__':
     print(f"\n[Stage 1] Pre-training RSNN with Predictive E-prop (Batch Size: {cfg.batch_size})...")
     rsnn = PredictiveEPropNet(cfg, device=device)
     
+    stage1_optimizer = optim.Adam(rsnn.parameters(), lr=0.002) # 全体バッチ更新向けに学習率を調整
+    
     for epoch in range(cfg.stage1_epochs):
         epoch_mse_loss = 0.0
         for batch_idx, (inputs, _, _, _, mask) in enumerate(train_loader):
-            _, _, mse_loss = rsnn.run_forward(inputs, mask)
+            _, _, mse_loss = rsnn.run_forward(inputs, mask, adam_optimizer=stage1_optimizer)
             epoch_mse_loss += mse_loss
             
         avg_mse_loss = epoch_mse_loss / len(train_loader)
@@ -502,7 +512,7 @@ if __name__ == '__main__':
                 _, z_bar_bar_seq, _ = rsnn.run_forward(inputs, mask)
             
             optimizer.zero_grad()
-            log_probs = decoder(z_bar_bar_seq) # (Time, Batch, 40)
+            log_probs = decoder(z_bar_bar_seq)
             
             loss = ctc_loss_fn(log_probs, targets, input_lengths, target_lengths)
             loss.backward()
@@ -523,17 +533,15 @@ if __name__ == '__main__':
         with torch.no_grad():
             _, test_z_bar_bar_seq, _ = rsnn.run_forward(inputs, mask)
             log_probs = decoder(test_z_bar_bar_seq)
-            probs_np = torch.exp(log_probs[:, 0, :]).cpu().numpy() # batch_size=1なので[0]を指定
+            probs_np = torch.exp(log_probs[:, 0, :]).cpu().numpy()
 
         hyp_path = ctc_beam_search_decoder(probs_np, beam_width=cfg.beam_width, blank=cfg.blank_id)
-        
-        # paddingを除外した正解パスを取得
         ref_path = targets[0].cpu().tolist()
         
         per = compute_per(ref_path, hyp_path)
         total_per += per
         
-        if i < 3: # 最初の3サンプルを表示
+        if i < 3:
             print(f"\n  [Test Sample {i+1}]")
             print(f"    Reference              : {[ID_TO_PHONEME[idx] for idx in ref_path if idx != 0]}")
             print(f"    Hypothesis             : {[ID_TO_PHONEME[idx] for idx in hyp_path if idx != 0]}")
