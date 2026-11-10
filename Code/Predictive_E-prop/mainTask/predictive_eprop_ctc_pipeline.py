@@ -7,6 +7,8 @@ import datetime
 import os
 import pickle
 from dataclasses import dataclass
+from torch.utils.data import Dataset, DataLoader
+from typing import Tuple, List
 
 # デバイス設定
 device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
@@ -22,8 +24,8 @@ class Config:
     time_step_dt: float = 1.0
 
     # 学習・最適化パラメータ
-    eta_rec: float = 0.0004
-    eta_out: float = 0.0004
+    eta_rec: float = 0.001
+    eta_out: float = 0.001
     lambda_w: float = 5e-6
     lambda_reg: float = 2.0
     t_delay: int = 10
@@ -46,7 +48,7 @@ class Config:
     I_bias: float = 0.02
     tau_mem: float = 20.0
     tau_alif: float = 2000.0
-    beta: float = 0.3
+    beta: float = 0.02
     tau_r: float = 50.0
     tau_d: float = 125.0
     t_ref: float = 5.0
@@ -58,12 +60,13 @@ class Config:
     mu_s: float = 0.0
 
     # 実行設定
-    stage1_epochs: int = 5
+    stage1_epochs: int = 60
     stage2_epochs: int = 30
     beam_width: int = 100
+    batch_size: int = 8      # 【追加】バッチサイズ
     
     # データパス設定
-    data_base_dir: str = "/home/keitaro-sunagawa/Master-Research/TIMIT" # 実際のディレクトリ構造に合わせて変更してください
+    data_base_dir: str = "/home/keitaro-sunagawa/Master-Research/TIMIT" # 環境に合わせて変更
     features_pickle_name: str = "filter_banks.pickle"
     targets_pickle_name: str = "reduced_phonems.pickle"
 
@@ -73,9 +76,8 @@ class Config:
 
 
 # ==========================================
-# 2. 音素リスト定義 (Encoder と完全に同期)
+# 2. 音素リスト定義
 # ==========================================
-# Encoder側ですでに39音素に縮約済みのため、マッピング処理は不要
 PHONEME_LIST = [
     '<blank>', 'sil', 'aa', 'ae', 'ah', 'aw', 'ay', 'b', 'ch', 'd', 'dh', 'dx', 'eh', 'er',
     'ey', 'f', 'g', 'hh', 'ih', 'iy', 'jh', 'k', 'l', 'm', 'n', 'ng', 'ow', 'oy',
@@ -86,7 +88,7 @@ ID_TO_PHONEME = {i: p for p, i in PHONEME_TO_ID.items()}
 
 
 # ==========================================
-# 3. RSNNモジュール (Stage 1 用)
+# 3. RSNNモジュール (Stage 1 用・バッチ対応済)
 # ==========================================
 class BaseNeuronGroup:
     def __init__(self, n_neurons, cfg: Config, device=device):
@@ -97,17 +99,17 @@ class BaseNeuronGroup:
         self.decay_r = float(np.exp(-cfg.time_step_dt / cfg.tau_r))
         self.decay_d = float(np.exp(-cfg.time_step_dt / cfg.tau_d))
         self.c_rd = 1.0 / (cfg.tau_r * cfg.tau_d)
-        self.reset_state()
-
-    def reset_state(self):
-        self.v = torch.zeros(self.n, device=self.device)
-        self.z = torch.zeros(self.n, device=self.device)
-        self.z_bar = torch.zeros(self.n, device=self.device)
-        self.z_bar_bar = torch.zeros(self.n, device=self.device)
-        self.q = torch.full((self.n,), self.c_rd, device=self.device)
-        self.psi = torch.zeros(self.n, device=self.device)
-        self.b = torch.full((self.n,), self.cfg.v_th, device=self.device)
-        self.ref_counts = torch.zeros(self.n, device=self.device)
+        
+    def reset_state(self, batch_size):
+        # テンソルにバッチ次元 (batch_size, n_neurons) を追加
+        self.v = torch.zeros(batch_size, self.n, device=self.device)
+        self.z = torch.zeros(batch_size, self.n, device=self.device)
+        self.z_bar = torch.zeros(batch_size, self.n, device=self.device)
+        self.z_bar_bar = torch.zeros(batch_size, self.n, device=self.device)
+        self.q = torch.full((batch_size, self.n), self.c_rd, device=self.device)
+        self.psi = torch.zeros(batch_size, self.n, device=self.device)
+        self.b = torch.full((batch_size, self.n), self.cfg.v_th, device=self.device)
+        self.ref_counts = torch.zeros(batch_size, self.n, device=self.device)
 
     def _update_spikes_and_filters(self, v_next_raw, b_next):
         self.psi = (self.cfg.gamma_d / self.cfg.v_th) * torch.clamp(1.0 - torch.abs((v_next_raw - b_next) / self.cfg.v_th), min=0.0)
@@ -135,7 +137,7 @@ class LIFGroup(BaseNeuronGroup):
 
     def step(self, input_current):
         v_next_raw = self.alpha * self.v + input_current
-        b_next = torch.full((self.n,), self.cfg.v_th, device=self.device)
+        b_next = torch.full_like(self.b, self.cfg.v_th, device=self.device)
         self._update_spikes_and_filters(v_next_raw, b_next)
 
 class ALIFGroup(BaseNeuronGroup):
@@ -143,11 +145,10 @@ class ALIFGroup(BaseNeuronGroup):
         super().__init__(n_neurons, cfg, **kwargs)
         self.beta = cfg.beta
         self.rho = float(np.exp(-cfg.time_step_dt / cfg.tau_alif))
-        self.a = torch.zeros(self.n, device=self.device)
 
-    def reset_state(self):
-        super().reset_state()
-        self.a = torch.zeros(self.n, device=self.device)
+    def reset_state(self, batch_size):
+        super().reset_state(batch_size)
+        self.a = torch.zeros(batch_size, self.n, device=self.device)
 
     def step(self, input_current):
         self.a = self.rho * self.a + self.z
@@ -163,51 +164,62 @@ class EPropOptimizer:
         self.decay_r = decay_r
         self.decay_d = decay_d
         self.c_rd = c_rd
-        self.reset_traces()
 
-    def reset_traces(self):
+    def reset_traces(self, batch_size):
         n = self.cfg.n_neurons
         o = self.cfg.n_outputs
-        self.e_trace = torch.zeros((n, n), device=self.device)
-        self.eps_b = torch.zeros((n, n), device=self.device)
-        self.q = torch.zeros((n, n), device=self.device)
-        self.e_bar_bar = torch.zeros((n, n), device=self.device)
+        
+        # トレースにバッチ次元 (Batch, Post, Pre) を追加
+        self.e_trace = torch.zeros((batch_size, n, n), device=self.device)
+        self.eps_b = torch.zeros((batch_size, n, n), device=self.device)
+        self.q = torch.zeros((batch_size, n, n), device=self.device)
+        self.e_bar_bar = torch.zeros((batch_size, n, n), device=self.device)
+        self.e_trace_sum_t_delays = torch.zeros((batch_size, n, n), device=self.device)
+        self.spike_buffer = torch.zeros((batch_size, n), device=self.device)
+        
+        # 勾配はバッチで平均を取って蓄積するため (Post, Pre)
         self.grad_w_rec = torch.zeros((n, n), device=self.device)
         self.grad_w_out = torch.zeros((o, n), device=self.device)
         self.grad_w_rec_accumulated = torch.zeros((n, n), device=self.device)
         self.grad_w_out_accumulated = torch.zeros((o, n), device=self.device)
-        self.spike_buffer = torch.zeros(n, device=self.device)
-        self.e_trace_sum_t_delays = torch.zeros((n, n), device=self.device)
+        
         self.step_counter = 0
 
-    def update_traces_and_gradients(self, neurons, z_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t):
+    def update_traces_and_gradients(self, neurons, z_bar_curr, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, error_t, mask_t):
         for idx, g in enumerate(neurons):
             offset = 0 if idx == 0 else neurons[0].n
             n_g, beta, rho = g.n, g.beta, getattr(g, "rho", 0.0)
-            psi_curr = g.psi.unsqueeze(1)
-            psi_prev_g = psi_prev[offset:offset + n_g].unsqueeze(1)
+            
+            # shape変換: (Batch, Neurons) -> (Batch, Neurons, 1)
+            psi_curr = g.psi.unsqueeze(2) 
+            psi_prev_g = psi_prev[:, offset:offset + n_g].unsqueeze(2)
 
             if beta > 0:
-                self.eps_b[offset:offset + n_g, :] = psi_prev_g * z_bar_prev_prev.unsqueeze(0) + (rho - beta * psi_prev_g) * self.eps_b[offset:offset + n_g, :]
-            self.e_trace[offset:offset + n_g, :] = psi_curr * (z_bar_prev.unsqueeze(0) - beta * self.eps_b[offset:offset + n_g, :])
+                self.eps_b[:, offset:offset + n_g, :] = psi_prev_g * z_bar_prev_prev.unsqueeze(1) + (rho - beta * psi_prev_g) * self.eps_b[:, offset:offset + n_g, :]
+            self.e_trace[:, offset:offset + n_g, :] = psi_curr * (z_bar_prev.unsqueeze(1) - beta * self.eps_b[:, offset:offset + n_g, :])
 
         self.e_bar_bar = self.decay_d * self.e_bar_bar + self.q
         self.q = self.decay_r * self.q + self.e_trace
 
-        self.grad_w_rec_accumulated += L_t.unsqueeze(1) * self.e_bar_bar
-        self.grad_w_out_accumulated += torch.outer(error_t, z_bar_curr)
+        # 有効なシーケンス（mask_t==1）のみ勾配を計算してバッチ平均をとる
+        grad_rec_step = (L_t.unsqueeze(2) * self.e_bar_bar) * mask_t.unsqueeze(2) # (B, n, n)
+        self.grad_w_rec_accumulated += grad_rec_step.mean(dim=0)
+        
+        grad_out_step = torch.bmm(error_t.unsqueeze(2), z_bar_curr.unsqueeze(1)) * mask_t.unsqueeze(2) # (B, o, n)
+        self.grad_w_out_accumulated += grad_out_step.mean(dim=0)
 
-        self.spike_buffer += torch.cat([g.z for g in neurons])
-        self.e_trace_sum_t_delays += self.e_trace
+        # マスクをかけてスパイクバッファと遅延トレースを更新
+        self.spike_buffer += torch.cat([g.z for g in neurons], dim=1) * mask_t
+        self.e_trace_sum_t_delays += self.e_trace * mask_t.unsqueeze(2)
         self.step_counter += 1
 
         if self.step_counter >= self.cfg.t_delay:
             self.grad_w_rec = self.grad_w_rec_accumulated.clone()
             self.grad_w_out = self.grad_w_out_accumulated.clone()
             
-            f_bar = self.spike_buffer / self.cfg.t_delay
+            f_bar = self.spike_buffer.mean(dim=0) / self.cfg.t_delay
             reg_signal = (self.cfg.lambda_reg / self.cfg.t_delay) * (f_bar - self.cfg.f_star)
-            self.grad_w_rec += reg_signal.unsqueeze(1) * self.e_trace_sum_t_delays
+            self.grad_w_rec += reg_signal.unsqueeze(1) * self.e_trace_sum_t_delays.mean(dim=0)
 
             self.spike_buffer.zero_()
             self.e_trace_sum_t_delays.zero_()
@@ -241,54 +253,66 @@ class PredictiveEPropNet:
         self.w_out = torch.randn(cfg.n_outputs, cfg.n_neurons, device=device) / np.sqrt(cfg.n_neurons)
         self.B = torch.randn(cfg.n_neurons, cfg.n_outputs, device=device) / np.sqrt(cfg.n_neurons)
 
-        self.s = torch.zeros(cfg.n_neurons, device=device)
         self.optimizer = EPropOptimizer(cfg=self.cfg, decay_r=self.lif.decay_r, decay_d=self.lif.decay_d, c_rd=self.lif.c_rd, device=device)
         self.requires_grad = True
 
-    def reset_state(self):
-        self.lif.reset_state()
-        self.alif.reset_state()
-        self.optimizer.reset_traces()
-        self.s.zero_()
+    def reset_state(self, batch_size):
+        self.s = torch.zeros(batch_size, self.cfg.n_neurons, device=self.device)
+        self.lif.reset_state(batch_size)
+        self.alif.reset_state(batch_size)
+        self.optimizer.reset_traces(batch_size)
 
     @torch.no_grad()
-    def run_forward(self, inputs):
-        self.reset_state()
-        timesteps = inputs.shape[0]
-        outputs = torch.zeros((timesteps, self.cfg.n_outputs), device=self.device)
-        z_bar_bar_seq = torch.zeros((timesteps, self.cfg.n_neurons), device=self.device)
+    def run_forward(self, inputs, mask):
+        # inputs: (Time, Batch, Features)
+        # mask: (Time, Batch)
+        timesteps, batch_size, _ = inputs.shape
+        self.reset_state(batch_size)
+        
+        outputs = torch.zeros((timesteps, batch_size, self.cfg.n_outputs), device=self.device)
+        z_bar_bar_seq = torch.zeros((timesteps, batch_size, self.cfg.n_neurons), device=self.device)
 
-        z_bar_prev = torch.zeros(self.cfg.n_neurons, device=self.device)
-        z_bar_prev_prev = torch.zeros(self.cfg.n_neurons, device=self.device)
-        psi_prev = torch.zeros(self.cfg.n_neurons, device=self.device)
+        z_bar_prev = torch.zeros(batch_size, self.cfg.n_neurons, device=self.device)
+        z_bar_prev_prev = torch.zeros(batch_size, self.cfg.n_neurons, device=self.device)
+        psi_prev = torch.zeros(batch_size, self.cfg.n_neurons, device=self.device)
 
         for t in range(timesteps):
-            x_t = inputs[t]
-            all_z_bar_bar = torch.cat([self.lif.z_bar_bar, self.alif.z_bar_bar])
-            all_z_bar = torch.cat([self.lif.z_bar, self.alif.z_bar])
+            x_t = inputs[t]             # (Batch, Features)
+            m_t = mask[t].unsqueeze(1)  # (Batch, 1)
+
+            all_z_bar_bar = torch.cat([self.lif.z_bar_bar, self.alif.z_bar_bar], dim=1)
+            all_z_bar = torch.cat([self.lif.z_bar, self.alif.z_bar], dim=1)
 
             z_bar_bar_seq[t] = all_z_bar_bar
 
-            y_t = self.w_out @ all_z_bar_bar
+            # 行列積をバッチ対応 (z @ W.T) に変更
+            y_t = all_z_bar_bar @ self.w_out.T
             outputs[t] = y_t
-            d_t = y_t - x_t  # 予測誤差
+            d_t = (y_t - x_t) * m_t  # 予測誤差（マスク適用）
 
-            i_rec = self.w_rec @ all_z_bar_bar
-            i_in = self.w_in @ d_t
-            i_fb = self.w_fb @ y_t
+            i_rec = all_z_bar_bar @ self.w_rec.T
+            i_in = d_t @ self.w_in.T
+            i_fb = y_t @ self.w_fb.T
             
             theta = self.cfg.time_step_dt / self.cfg.tau_s
-            self.s = self.s + (self.cfg.mu_s - self.s) * theta + self.cfg.sigma_s * theta * torch.randn(self.cfg.n_neurons, device=self.device)
+            self.s = self.s + (self.cfg.mu_s - self.s) * theta + self.cfg.sigma_s * theta * torch.randn(batch_size, self.cfg.n_neurons, device=self.device)
 
             total_current = i_in + i_rec + i_fb + self.cfg.I_bias # + self.s
 
-            self.lif.step(total_current[:self.cfg.n_lif])
-            self.alif.step(total_current[self.cfg.n_lif:])
+            self.lif.step(total_current[:, :self.cfg.n_lif])
+            self.alif.step(total_current[:, self.cfg.n_lif:])
+            
+            # マスクの適用（シーケンス終了後はスパイクを抑制）
+            self.lif.z *= m_t
+            self.alif.z *= m_t
 
             if self.requires_grad:
-                L_t = self.B @ d_t
-                all_psi = torch.cat([self.lif.psi, self.alif.psi])
-                should_update = self.optimizer.update_traces_and_gradients(self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t)
+                L_t = d_t @ self.B.T
+                all_psi = torch.cat([self.lif.psi, self.alif.psi], dim=1)
+                
+                should_update = self.optimizer.update_traces_and_gradients(
+                    self.neurons, all_z_bar, z_bar_prev, z_bar_prev_prev, psi_prev, L_t, d_t, m_t
+                )
                 
                 if should_update:
                     self.w_rec, self.w_out = self.optimizer.apply_weight_update(self.w_rec, self.w_out)
@@ -298,8 +322,9 @@ class PredictiveEPropNet:
                 z_bar_prev = all_z_bar.clone()
                 psi_prev = all_psi.clone()
 
-        loss = torch.mean((outputs - inputs) ** 2).item()
-        return outputs, z_bar_bar_seq, loss
+        # パディング部分を無視したMSE計算
+        mse_loss = torch.sum(((outputs - inputs) ** 2) * mask.unsqueeze(2)) / (mask.sum() * self.cfg.n_outputs)
+        return outputs, z_bar_bar_seq, mse_loss.item()
 
 # ==========================================
 # 4. CTCデコーダモジュール (Stage 2 用)
@@ -315,28 +340,54 @@ class CTCDecoder(nn.Module):
 
 
 # ==========================================
-# 5. Utils (データロード, PER評価 & ビームサーチ)
+# 5. Utils & DataLoader (バッチ対応)
 # ==========================================
 def load_pickle_dataset(feature_path, target_path):
-    if not os.path.exists(feature_path) or not os.path.exists(target_path):
-        raise FileNotFoundError(f"Pickle files not found: {feature_path} or {target_path}. "
-                                f"Please ensure the data has been processed and paths are correct.")
-    
     with open(feature_path, 'rb') as f:
         features = pickle.load(f)
-    
     with open(target_path, 'rb') as f:
         targets = pickle.load(f)
-        
     return features, targets
 
 def process_target_sequence(target_arr):
-    """ CTCのターゲットとして連続重複を削除した配列を構築する """
     target_unique = [target_arr[0]]
     for val in target_arr[1:]:
         if val != target_unique[-1]:
             target_unique.append(val)
     return np.array(target_unique, dtype=np.int64)
+
+class TimitDataset(Dataset):
+    def __init__(self, features, targets):
+        self.features = features
+        self.targets = targets
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        feat = torch.tensor(self.features[idx], dtype=torch.float32)
+        # IDを+1シフトして連続重複を削除
+        tgt = np.array(self.targets[idx], dtype=np.int64) + 1
+        tgt = process_target_sequence(tgt)
+        label = torch.tensor(tgt, dtype=torch.long)
+        return feat, label
+
+def collate_fn(batch):
+    features, labels = zip(*batch)
+    lengths = torch.tensor([f.size(0) for f in features], dtype=torch.long)
+    target_lengths = torch.tensor([l.size(0) for l in labels], dtype=torch.long)
+    
+    # バッチの最大長に合わせてパディング
+    padded_features = nn.utils.rnn.pad_sequence(features, batch_first=False, padding_value=0.0) # (Time, Batch, Features)
+    padded_labels = nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=0) # (Batch, TargetLen)
+    
+    # マスクの作成 (Time, Batch)
+    max_len = padded_features.size(0)
+    batch_size = len(features)
+    mask = torch.arange(max_len).unsqueeze(1) < lengths.unsqueeze(0)
+    
+    return padded_features.to(device), padded_labels.to(device), lengths.to(device), target_lengths.to(device), mask.float().to(device)
+
 
 def ctc_beam_search_decoder(probs_np, beam_width, blank=0):
     T, C = probs_np.shape
@@ -372,7 +423,6 @@ def ctc_beam_search_decoder(probs_np, beam_width, blank=0):
     return list(best_path)
 
 def compute_per(ref_phns, hyp_phns):
-    # すでに39音素に縮約済みの為、文字列として直接編集距離を比較
     ref_str = [ID_TO_PHONEME[i] for i in ref_phns if i != 0]
     hyp_str = [ID_TO_PHONEME[i] for i in hyp_phns if i != 0]
     
@@ -391,120 +441,105 @@ def compute_per(ref_phns, hyp_phns):
 
 
 # ==========================================
-# 6. メインパイプライン (事前学習 -> デコーダ学習 -> 評価)
+# 6. メインパイプライン (ミニバッチ学習対応)
 # ==========================================
 if __name__ == '__main__':
     cfg = Config()
     
-    # --- 1. Pickleファイルからデータをロード ---
-    print(f"\n[Init] Loading acoustic features and targets from base directory '{cfg.data_base_dir}'...")
+    print(f"\n[Init] Loading acoustic features and targets from '{cfg.data_base_dir}'...")
     
     train_features_path = os.path.join(cfg.data_base_dir, "train_pickle", cfg.features_pickle_name)
     train_targets_path = os.path.join(cfg.data_base_dir, "train_pickle", cfg.targets_pickle_name)
     test_features_path = os.path.join(cfg.data_base_dir, "test_pickle", cfg.features_pickle_name)
     test_targets_path = os.path.join(cfg.data_base_dir, "test_pickle", cfg.targets_pickle_name)
 
-    try:
-        train_feat_list, train_tgt_list = load_pickle_dataset(train_features_path, train_targets_path)
-        test_feat_list, test_tgt_list = load_pickle_dataset(test_features_path, test_targets_path)
-        
-        # デモンストレーションのため、最初のシーケンスを抽出
-        train_input_np = np.array(train_feat_list[0], dtype=np.float32)
-        
-        # 【修正】以前のエンコーダ出力との整合性を取るため、ターゲットID全体に +1 をしてシフトさせる
-        train_target_np = np.array(train_tgt_list[0], dtype=np.int64) + 1
-        
-        test_input_np = np.array(test_feat_list[0], dtype=np.float32)
-        
-        # 【修正】こちらも +1 をする
-        test_target_np = np.array(test_tgt_list[0], dtype=np.int64) + 1
-        
-        train_target_np = process_target_sequence(train_target_np)
-        test_target_np = process_target_sequence(test_target_np)
-        print("Successfully loaded train and test sequences from directories.")
+    train_feat_list, train_tgt_list = load_pickle_dataset(train_features_path, train_targets_path)
+    test_feat_list, test_tgt_list = load_pickle_dataset(test_features_path, test_targets_path)
 
-    except FileNotFoundError as e:
-        print(e)
-        print("Using dummy data instead to demonstrate the pipeline...")
-        train_input_np = np.random.randn(500, cfg.n_inputs).astype(np.float32) * 0.5 + 1.0
-        test_input_np = np.random.randn(400, cfg.n_inputs).astype(np.float32) * 0.5 + 1.0
-        train_target_np = np.random.randint(1, cfg.n_phonemes_out, (15,), dtype=np.int64)
-        test_target_np = np.random.randint(1, cfg.n_phonemes_out, (12,), dtype=np.int64)
+    # 入力次元数の動的設定
+    cfg.n_inputs = train_feat_list[0].shape[1]
+    cfg.n_outputs = train_feat_list[0].shape[1]
 
-    train_seq_len = train_input_np.shape[0]
-    test_seq_len = test_input_np.shape[0]
+    # DataLoaderの作成
+    train_dataset = TimitDataset(train_feat_list, train_tgt_list)
+    test_dataset = TimitDataset(test_feat_list, test_tgt_list)
     
-    # 入力次元数の動的調整
-    cfg.n_inputs = train_input_np.shape[1]
-    cfg.n_outputs = train_input_np.shape[1]
-    
-    train_input_tensor = torch.tensor(train_input_np, device=device)
-    train_target_tensor = torch.tensor(train_target_np, device=device)
-    test_input_tensor = torch.tensor(test_input_np, device=device)
-    test_target_tensor = torch.tensor(test_target_np, device=device)
-    
-    train_target_lengths = torch.tensor([len(train_target_tensor)], device=device, dtype=torch.long)
-    train_input_lengths = torch.tensor([train_seq_len], device=device, dtype=torch.long)
+    train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
 
     # --- 2. [実行1] Stage 1 実行: Predictive E-prop RSNN ---
-    print(f"\n[Stage 1] Pre-training RSNN with Predictive E-prop on training sequence (len: {train_seq_len})...")
+    print(f"\n[Stage 1] Pre-training RSNN with Predictive E-prop (Batch Size: {cfg.batch_size})...")
     rsnn = PredictiveEPropNet(cfg, device=device)
     
     for epoch in range(cfg.stage1_epochs):
-        _, _, mse_loss = rsnn.run_forward(train_input_tensor)
-        print(f"  Stage 1 - Epoch {epoch+1}/{cfg.stage1_epochs} | MSE Loss: {mse_loss:.5f}")
+        epoch_mse_loss = 0.0
+        for batch_idx, (inputs, _, _, _, mask) in enumerate(train_loader):
+            _, _, mse_loss = rsnn.run_forward(inputs, mask)
+            epoch_mse_loss += mse_loss
+            
+        avg_mse_loss = epoch_mse_loss / len(train_loader)
+        print(f"  Stage 1 - Epoch {epoch+1}/{cfg.stage1_epochs} | Avg MSE Loss: {avg_mse_loss:.5f}")
 
 
     # --- 3. [実行2] フリーズ & 切替 ---
     print("\n[Transition] Freezing RSNN parameters and attaching CTC Decoder...")
-    rsnn.requires_grad = False  # E-prop更新の停止
-    
+    rsnn.requires_grad = False
     decoder = CTCDecoder(cfg.n_neurons, cfg.n_phonemes_out).to(device)
-    optimizer = optim.Adam(decoder.parameters(), lr=0.01)
+    optimizer = optim.Adam(decoder.parameters(), lr=0.001)
     ctc_loss_fn = nn.CTCLoss(blank=cfg.blank_id, zero_infinity=True)
 
 
     # --- 4. [実行3] Stage 2 実行: CTCデコーダ学習 ---
-    print("\n[Stage 2] Fine-tuning Decoder with CTC Loss on training sequence...")
+    print(f"\n[Stage 2] Fine-tuning Decoder with CTC Loss (Batch Size: {cfg.batch_size})...")
     decoder.train()
     
     for epoch in range(cfg.stage2_epochs):
-        with torch.no_grad():
-            _, z_bar_bar_seq, _ = rsnn.run_forward(train_input_tensor)
-        
-        # CTC Decoder へ入力 (Shape: [T, Batch, Features])
-        z_bar_bar_seq = z_bar_bar_seq.unsqueeze(1) 
-        
-        optimizer.zero_grad()
-        log_probs = decoder(z_bar_bar_seq) # [T, 1, 40]
-        
-        loss = ctc_loss_fn(log_probs, train_target_tensor.unsqueeze(0), train_input_lengths, train_target_lengths)
-        loss.backward()
-        optimizer.step()
-        
-        print(f"  Stage 2 - Epoch {epoch+1}/{cfg.stage2_epochs} | CTC Loss: {loss.item():.5f}")
+        epoch_ctc_loss = 0.0
+        for batch_idx, (inputs, targets, input_lengths, target_lengths, mask) in enumerate(train_loader):
+            
+            with torch.no_grad():
+                _, z_bar_bar_seq, _ = rsnn.run_forward(inputs, mask)
+            
+            optimizer.zero_grad()
+            log_probs = decoder(z_bar_bar_seq) # (Time, Batch, 40)
+            
+            loss = ctc_loss_fn(log_probs, targets, input_lengths, target_lengths)
+            loss.backward()
+            optimizer.step()
+            
+            epoch_ctc_loss += loss.item()
+            
+        avg_ctc_loss = epoch_ctc_loss / len(train_loader)
+        print(f"  Stage 2 - Epoch {epoch+1}/{cfg.stage2_epochs} | Avg CTC Loss: {avg_ctc_loss:.5f}")
 
 
     # --- 5. [実行4] 評価実行: ビームサーチデコードとPER算出 ---
-    print(f"\n[Stage 3] Evaluation on test sequence (len: {test_seq_len}): Beam Search Decoding & PER Computation...")
+    print(f"\n[Stage 3] Evaluation on test sequences...")
     decoder.eval()
-    with torch.no_grad():
-        # テストデータをRSNNに通して特徴抽出
-        _, test_z_bar_bar_seq, _ = rsnn.run_forward(test_input_tensor)
-        test_z_bar_bar_seq = test_z_bar_bar_seq.unsqueeze(1)
-        log_probs = decoder(test_z_bar_bar_seq)
-        probs_np = torch.exp(log_probs.squeeze(1)).cpu().numpy()
+    
+    total_per = 0.0
+    for i, (inputs, targets, input_lengths, _, mask) in enumerate(test_loader):
+        with torch.no_grad():
+            _, test_z_bar_bar_seq, _ = rsnn.run_forward(inputs, mask)
+            log_probs = decoder(test_z_bar_bar_seq)
+            probs_np = torch.exp(log_probs[:, 0, :]).cpu().numpy() # batch_size=1なので[0]を指定
 
-    # ビームサーチデコード
-    hyp_path = ctc_beam_search_decoder(probs_np, beam_width=cfg.beam_width, blank=cfg.blank_id)
-    ref_path = test_target_tensor.cpu().tolist()
-    
-    # PER（音素エラー率）の計算
-    per = compute_per(ref_path, hyp_path)
-    
-    print("\n=== Evaluation Results (Test Data) ===")
-    print(f"  Reference              : {[ID_TO_PHONEME[i] for i in ref_path]}")
-    print(f"  Hypothesis             : {[ID_TO_PHONEME[i] for i in hyp_path if i != 0]}")
-    print(f"  Phoneme Error Rate(PER): {per * 100:.2f}%")
+        hyp_path = ctc_beam_search_decoder(probs_np, beam_width=cfg.beam_width, blank=cfg.blank_id)
+        
+        # paddingを除外した正解パスを取得
+        ref_path = targets[0].cpu().tolist()
+        
+        per = compute_per(ref_path, hyp_path)
+        total_per += per
+        
+        if i < 3: # 最初の3サンプルを表示
+            print(f"\n  [Test Sample {i+1}]")
+            print(f"    Reference              : {[ID_TO_PHONEME[idx] for idx in ref_path if idx != 0]}")
+            print(f"    Hypothesis             : {[ID_TO_PHONEME[idx] for idx in hyp_path if idx != 0]}")
+            print(f"    PER                    : {per * 100:.2f}%")
+
+    avg_per = total_per / len(test_loader)
+    print("\n======================================")
+    print(f"  Final Average Phoneme Error Rate (PER) on Test Set: {avg_per * 100:.2f}%")
     print("======================================")
