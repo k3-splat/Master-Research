@@ -57,6 +57,10 @@ class HPEPropConfig:
     tau_r: float = 20.0
     tau_d: float = 50.0
 
+    # 発火率正則化 (E-prop Supplementary Note 2)
+    c_reg: float = 1.0          # 正則化強度係数 (0.0 で無効化)
+    f_target_hz: float = 10.0   # 目標発火率 [Hz]
+
     # 学習・最適化パラメータ (バッチごとに重み更新)
     batch_size: int = 8
     epochs: int = 20
@@ -85,6 +89,10 @@ class HPEPropConfig:
     @property
     def refractory_steps(self) -> int:
         return max(0, int(round(self.refractory_ms / self.dt)))
+
+    @property
+    def f_target_per_step(self) -> float:
+        return self.f_target_hz * (self.dt / 1000.0)
 
     @property
     def alpha_l1(self) -> float:
@@ -118,7 +126,8 @@ class HPEPropConfig:
 class EligibilityTrace2D:
     """
     ALIF / LIF 統一の適格性ベクトル (eps_v, eps_a)、適格性トレース e、
-    およびダブル指数フィルタ済みトレース e_bar を GPU 上で保持・更新するクラス。
+    ダブル指数フィルタ済みトレース e_bar、および発火率正則化用のサンプル別累積トレース e_sum を
+    GPU 上で保持・更新するクラス。
     形状: (batch_size, n_post, n_pre)
     """
 
@@ -136,6 +145,8 @@ class EligibilityTrace2D:
         self.q_e = torch.zeros(shape, device=dev, dtype=dt)
         self.e_bar = torch.zeros(shape, device=dev, dtype=dt)
         self.e_bar_prev = torch.zeros(shape, device=dev, dtype=dt)
+        # 発火率正則化用: バッチ内の各サンプルごとの有効時間ステップ和 \sum_t m_{b,t} e_{b,ji}^t
+        self.e_sum = torch.zeros(shape, device=dev, dtype=dt)
 
         self.decay_r = cfg.decay_r
         self.decay_d = cfg.decay_d
@@ -153,6 +164,7 @@ class EligibilityTrace2D:
         b_prev: torch.Tensor,       # (B, n_post)
         z_prev: torch.Tensor,       # (B, n_post)
         pre_input: torch.Tensor,    # (B, n_pre)
+        mask_t: Optional[torch.Tensor] = None,  # (B, 1)
     ) -> torch.Tensor:
         """
         論文 式 (37)-(41), (50)-(51) に基づく適格性トレースと二重フィルタの更新。
@@ -182,6 +194,12 @@ class EligibilityTrace2D:
 
         # 適格性トレース e^t (式 41)
         e_curr = psi_c * (self.eps_v - beta_u * self.eps_a)
+
+        # 発火率正則化用にフィルタ前の e^t を各サンプルごとにマスク付きで累積
+        if mask_t is not None:
+            self.e_sum.add_(e_curr * mask_t.unsqueeze(-1))
+        else:
+            self.e_sum.add_(e_curr)
 
         # ダブル指数フィルタによる平滑化 (式 50, 51)
         self.e_bar.mul_(self.decay_d).add_(self.q_e)
@@ -339,7 +357,7 @@ class HPEPropNetwork(nn.Module):
     2層階層的予測符号化 SNN (HP E-prop) ネットワーク本体。
     - 第1層 (l=1): 一次聴覚野 A1 相当
     - 第2層 (l=2): 高次聴覚野 STG 相当
-    局所オンライン学習則 (e-prop) により W_rec, W_bottom, W_top をバッチごとに更新する。
+    局所オンライン学習則 (e-prop) + 発火率正則化により W_rec, W_bottom, W_top をバッチごとに更新する。
     """
 
     def __init__(self, cfg: HPEPropConfig) -> None:
@@ -443,7 +461,7 @@ class HPEPropNetwork(nn.Module):
             features: (batch_size, num_frames, n_in)
             mask:     (batch_size, num_frames)  [1.0: 有効, 0.0: パディング]
         を受け取り、各フレームを 5ms (frame_repeat_steps) 連続入力して
-        オンライン順伝播およびバッチごとの重み更新を実行する。
+        オンライン順伝播およびバッチごとの重み更新（サンプル別発火率正則化込み）を実行する。
         """
         repeat_steps = self.cfg.frame_repeat_steps
         x_seq = features.repeat_interleave(repeat_steps, dim=1)  # (B, T_frames * 5, n_in)
@@ -454,7 +472,8 @@ class HPEPropNetwork(nn.Module):
         else:
             m_seq = torch.ones((batch_size, seq_len), device=x_seq.device, dtype=x_seq.dtype)
 
-        # バッチ内の有効な (サンプル x 時刻) の総数 (勾配・損失の正規化用)
+        # 各サンプルごとの有効時間ステップ数 T_b (B, 1) とバッチ全体の有効ステップ総数
+        valid_steps_per_sample = m_seq.sum(dim=1, keepdim=True).clamp(min=1.0)
         valid_steps = m_seq.sum().clamp(min=1.0).item()
 
         self.reset_state(batch_size)
@@ -466,8 +485,9 @@ class HPEPropNetwork(nn.Module):
 
         total_loss_e0 = 0.0
         total_loss_e1 = 0.0
-        total_spikes_l1 = 0.0
-        total_spikes_l2 = 0.0
+        # 発火率正則化用: サンプルごと・ニューロンごとの有効スパイク総数 (B, n_l1), (B, n_l2)
+        spike_count_l1 = torch.zeros((batch_size, self.cfg.n_l1), device=x_seq.device, dtype=x_seq.dtype)
+        spike_count_l2 = torch.zeros((batch_size, self.cfg.n_l2), device=x_seq.device, dtype=x_seq.dtype)
 
         spikes_l1 = (
             torch.empty((batch_size, seq_len, self.cfg.n_l1), device=x_seq.device, dtype=x_seq.dtype)
@@ -492,8 +512,8 @@ class HPEPropNetwork(nn.Module):
             z1_t, z1_bar_t = self.l1.compute_spike_and_surrogate()
             z2_t, z2_bar_t = self.l2.compute_spike_and_surrogate()
 
-            total_spikes_l1 += (z1_t * m_t).sum().item()
-            total_spikes_l2 += (z2_t * m_t).sum().item()
+            spike_count_l1.add_(z1_t * m_t)
+            spike_count_l2.add_(z2_t * m_t)
             if spikes_l1 is not None and spikes_l2 is not None:
                 spikes_l1[:, t, :] = z1_t
                 spikes_l2[:, t, :] = z2_t
@@ -526,39 +546,39 @@ class HPEPropNetwork(nn.Module):
                 self.et_rec_1.update(
                     self.l1.alpha, self.l1.rho, self.cfg.v_th, self.l1.beta,
                     self.l1.psi_prev, self.l1.psi, self.l1.b_prev, self.l1.z_prev,
-                    self.l1.z_bar_prev,
+                    self.l1.z_bar_prev, mask_t=m_t,
                 )
                 self.et_rec_2.update(
                     self.l2.alpha, self.l2.rho, self.cfg.v_th, self.l2.beta,
                     self.l2.psi_prev, self.l2.psi, self.l2.b_prev, self.l2.z_prev,
-                    self.l2.z_bar_prev,
+                    self.l2.z_bar_prev, mask_t=m_t,
                 )
                 self.et_bot_0.update(
                     self.l1.alpha, self.l1.rho, self.cfg.v_th, self.l1.beta,
                     self.l1.psi_prev, self.l1.psi, self.l1.b_prev, self.l1.z_prev,
-                    self.e0_prev,
+                    self.e0_prev, mask_t=m_t,
                 )
                 self.et_bot_1.update(
                     self.l2.alpha, self.l2.rho, self.cfg.v_th, self.l2.beta,
                     self.l2.psi_prev, self.l2.psi, self.l2.b_prev, self.l2.z_prev,
-                    self.e1_prev,
+                    self.e1_prev, mask_t=m_t,
                 )
                 # W^{top,(1)} の自層経路 e_{top, ij}^{(1)} (式 94, 98)
                 self.et_top_1_self.update(
                     self.l1.alpha, self.l1.rho, self.cfg.v_th, self.l1.beta,
                     self.l1.psi_prev, self.l1.psi, self.l1.b_prev, self.l1.z_prev,
-                    self.l2.z_bar_prev2,
+                    self.l2.z_bar_prev2, mask_t=m_t,
                 )
                 # W^{top,(0)}, W^{top,(1)} の上位層経路 (因数分解版, 式 103, 105)
                 self.et_top_0_upper.update(
                     self.l1.alpha, self.l1.rho, self.cfg.v_th, self.l1.beta,
                     self.l1.psi_prev, self.l1.psi, self.l1.b_prev, self.l1.z_prev,
-                    self.l1.z_bar_prev2,
+                    self.l1.z_bar_prev2, mask_t=m_t,
                 )
                 self.et_top_1_upper.update(
                     self.l2.alpha, self.l2.rho, self.cfg.v_th, self.l2.beta,
                     self.l2.psi_prev, self.l2.psi, self.l2.b_prev, self.l2.z_prev,
-                    self.l2.z_bar_prev2,
+                    self.l2.z_bar_prev2, mask_t=m_t,
                 )
 
                 # --- 勾配のオンライン蓄積 (時刻 t-1 の学習シグナルが時刻 t の誤差で確定) ---
@@ -617,11 +637,48 @@ class HPEPropNetwork(nn.Module):
             self.e0_prev = e0_t
             self.e1_prev = e1_t
 
-        # 6. バッチごとのパラメータ更新
+        # 各サンプルごと・ニューロンごとの平均発火率 f_{b,j}^{av} [spikes / step] (B, n_l)
+        f_av_l1 = spike_count_l1 / valid_steps_per_sample
+        f_av_l2 = spike_count_l2 / valid_steps_per_sample
+        f_target = self.cfg.f_target_per_step
+
+        # 発火率正則化損失 (サンプルごとの損失のバッチ平均)
+        loss_reg_l1 = 0.5 * (f_av_l1 - f_target).pow(2).sum(dim=-1).mean().item()
+        loss_reg_l2 = 0.5 * (f_av_l2 - f_target).pow(2).sum(dim=-1).mean().item()
+
+        # 6. バッチごとのパラメータ更新 (予測誤差勾配 + サンプル別発火率正則化勾配をバッチサイズで平均化)
         if train:
+            num_sequences = mask.size(0) if mask is not None else batch_size
+
+            # サンプルごとの発火率正則化勾配を grad_acc に加算
+            if self.cfg.c_reg > 0.0:
+                assert (
+                    self.et_rec_1 is not None
+                    and self.et_rec_2 is not None
+                    and self.et_bot_0 is not None
+                    and self.et_bot_1 is not None
+                    and self.et_top_1_self is not None
+                    and self.et_top_0_upper is not None
+                    and self.et_top_1_upper is not None
+                )
+                # サンプルごとの正則化学習シグナル L_{reg, b}^{(l)} = c_reg * (f_{b}^{av} - f^{target}) / T_b  (B, n_l)
+                L_reg_1 = self.cfg.c_reg * (f_av_l1 - f_target) / valid_steps_per_sample
+                L_reg_2 = self.cfg.c_reg * (f_av_l2 - f_target) / valid_steps_per_sample
+
+                grad_acc["w_rec_1"].add_(torch.einsum("bi,bij->ij", L_reg_1, self.et_rec_1.e_sum))
+                grad_acc["w_rec_2"].add_(torch.einsum("bi,bij->ij", L_reg_2, self.et_rec_2.e_sum))
+                grad_acc["w_bot_0"].add_(torch.einsum("bi,bij->ij", L_reg_1, self.et_bot_0.e_sum))
+                grad_acc["w_bot_1"].add_(torch.einsum("bi,bij->ij", L_reg_2, self.et_bot_1.e_sum))
+
+                weighted_reg_top0 = torch.einsum("bk,bkj->kj", L_reg_1, self.et_top_0_upper.e_sum)
+                grad_acc["w_top_0"].sub_(torch.matmul(self.w_bot_0.t(), weighted_reg_top0))
+
+                grad_acc["w_top_1"].add_(torch.einsum("bi,bij->ij", L_reg_1, self.et_top_1_self.e_sum))
+                weighted_reg_top1 = torch.einsum("bk,bkj->kj", L_reg_2, self.et_top_1_upper.e_sum)
+                grad_acc["w_top_1"].sub_(torch.matmul(self.w_bot_1.t(), weighted_reg_top1))
+
             self.optimizer.zero_grad()
             for name, p in self.named_parameters():
-                num_sequences = mask.size(0) if mask is not None else batch_size
                 g = grad_acc[name] / num_sequences
                 if name == "w_rec_1":
                     g = g * self.diag_mask_1
@@ -638,12 +695,13 @@ class HPEPropNetwork(nn.Module):
             self.w_rec_1.mul_(self.diag_mask_1)
             self.w_rec_2.mul_(self.diag_mask_2)
 
-        fr_l1_hz = (total_spikes_l1 / (valid_steps * self.cfg.n_l1)) * (1000.0 / self.cfg.dt)
-        fr_l2_hz = (total_spikes_l2 / (valid_steps * self.cfg.n_l2)) * (1000.0 / self.cfg.dt)
+        fr_l1_hz = f_av_l1.mean().item() * (1000.0 / self.cfg.dt)
+        fr_l2_hz = f_av_l2.mean().item() * (1000.0 / self.cfg.dt)
 
         result: Dict[str, torch.Tensor] = {
             "loss_e0": torch.tensor(total_loss_e0 / valid_steps),
             "loss_e1": torch.tensor(total_loss_e1 / valid_steps),
+            "loss_reg": torch.tensor(loss_reg_l1 + loss_reg_l2),
             "fr_l1_hz": torch.tensor(fr_l1_hz),
             "fr_l2_hz": torch.tensor(fr_l2_hz),
         }
@@ -690,7 +748,8 @@ def train_timit(cfg: HPEPropConfig) -> HPEPropNetwork:
         f"Initializing HP E-prop on {cfg.device} | "
         f"feature={cfg.feature_type} (dim={cfg.n_in}) | "
         f"repeat={cfg.frame_repeat_ms}ms ({cfg.frame_repeat_steps} steps) | "
-        f"batch_size={cfg.batch_size}"
+        f"batch_size={cfg.batch_size} | "
+        f"c_reg={cfg.c_reg}, f_target={cfg.f_target_hz}Hz"
     )
 
     train_loader, dev_loader = build_timit_dataloaders(cfg)
@@ -698,13 +757,14 @@ def train_timit(cfg: HPEPropConfig) -> HPEPropNetwork:
 
     for epoch in range(1, cfg.epochs + 1):
         # --- Training (バッチごとに重み更新) ---
-        tr_e0, tr_e1, tr_fr1, tr_fr2 = 0.0, 0.0, 0.0, 0.0
+        tr_e0, tr_e1, tr_reg, tr_fr1, tr_fr2 = 0.0, 0.0, 0.0, 0.0, 0.0
         num_batches = len(train_loader)
 
         for batch_idx, (feats, _labels, mask) in enumerate(train_loader, start=1):
             out = model.forward_batch(feats, mask=mask, train=True, return_spikes=False)
             tr_e0 += out["loss_e0"].item()
             tr_e1 += out["loss_e1"].item()
+            tr_reg += out["loss_reg"].item()
             tr_fr1 += out["fr_l1_hz"].item()
             tr_fr2 += out["fr_l2_hz"].item()
 
@@ -712,17 +772,19 @@ def train_timit(cfg: HPEPropConfig) -> HPEPropNetwork:
                 print(
                     f"  Epoch {epoch:02d} [{batch_idx:04d}/{num_batches:04d}] | "
                     f"E0: {out['loss_e0'].item():.4f} | E1: {out['loss_e1'].item():.4f} | "
+                    f"Reg: {out['loss_reg'].item():.6f} | "
                     f"FR L1: {out['fr_l1_hz'].item():.1f} Hz | FR L2: {out['fr_l2_hz'].item():.1f} Hz"
                 )
 
         tr_e0 /= max(1, num_batches)
         tr_e1 /= max(1, num_batches)
+        tr_reg /= max(1, num_batches)
         tr_fr1 /= max(1, num_batches)
         tr_fr2 /= max(1, num_batches)
 
         msg = (
             f"Epoch {epoch:02d} Summary | "
-            f"Train E0: {tr_e0:.4f}, E1: {tr_e1:.4f}, "
+            f"Train E0: {tr_e0:.4f}, E1: {tr_e1:.4f}, Reg: {tr_reg:.6f}, "
             f"FR1: {tr_fr1:.1f} Hz, FR2: {tr_fr2:.1f} Hz"
         )
 
@@ -750,6 +812,8 @@ if __name__ == "__main__":
         n_l2=128,
         frame_repeat_ms=5.0,
         refractory_ms=5.0,
+        c_reg=1.0,
+        f_target_hz=10.0,
         batch_size=8,
         epochs=20,
         lr=1e-3,
