@@ -197,7 +197,7 @@ class EPropOptimizer:
             self.e_trace[:, offset:offset + n_g, :] = psi_curr * (z_bar_prev.unsqueeze(1) - beta * self.eps_b[:, offset:offset + n_g, :])
 
         self.e_bar_bar = self.decay_d * self.e_bar_bar + self.q
-        self.q = self.decay_r * self.q + self.e_trace
+        self.q = self.decay_r * self.q + self.c_rd * self.e_trace
 
         # チャンク用の勾配蓄積
         grad_rec_step = (L_t.unsqueeze(2) * self.e_bar_bar) * mask_t.unsqueeze(2)
