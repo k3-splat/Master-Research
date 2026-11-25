@@ -7,3 +7,7 @@
 $$\frac{\partial E}{\partial z_j^t}=\sum_{t'=t}^{T}\sum_k\frac{\partial E}{\partial y_k^{t'}}\frac{\partial y_k^{t'}}{\partial z_j^t}.$$
 - したがって二重フィルタを含むPredictive E-propの場合は次のようになる．
 $$\frac{\partial E}{\partial z_j^t}=\sum_{t'=t}^{T}\frac{\partial E}{\partial\bar{\bar{z}}_j^{t'}}\frac{\partial\bar{\bar{z}}_j^{t'}}{\partial z_j^t}.$$
+
+### 連鎖律
+- ある状態に対するある状態の全微分を考えるときは，微分する側の状態から直接行ける状態の数だけ分解をする
+- 直接行ける状態なので，連鎖律で分解したときに初めの項に全微分を押し付ければ，第2項は直接のみ考えればよく，偏微分となる
