@@ -621,7 +621,8 @@ class HPEPropNetwork(nn.Module):
         if train:
             self.optimizer.zero_grad()
             for name, p in self.named_parameters():
-                g = grad_acc[name] / valid_steps
+                num_sequences = mask.size(0) if mask is not None else batch_size
+                g = grad_acc[name] / num_sequences
                 if name == "w_rec_1":
                     g = g * self.diag_mask_1
                 elif name == "w_rec_2":
