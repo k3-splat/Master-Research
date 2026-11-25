@@ -24,8 +24,8 @@ class HPEPropConfig:
     """HP E-prop (Hierarchical Predictive E-prop) のハイパーパラメータ管理用 dataclass"""
 
     # データセット設定 (encoder.py の出力形式に対応)
-    processed_timit_dir: str = "/home/keitaro-sunagawa/Master-Research/Code/Predictive_E-prop/mainTask"
-    feature_type: str = "mfcc"  # "mfcc" (39次元) または "fbank" (123次元)
+    processed_timit_dir: str = "/home/keitaro-sunagawa/Master-Research/TIMIT/"
+    feature_type: str = "fbank"  # "mfcc" (39次元) または "fbank" (123次元)
 
     # ネットワーク構造 (入力次元, 第1層 A1, 第2層 STG)
     n_in: int = 39              # __post_init__ で feature_type に合わせて自動設定
@@ -37,7 +37,7 @@ class HPEPropConfig:
     # 時間・同一入力・不応期設定 [ms]
     dt: float = 1.0
     frame_repeat_ms: float = 5.0  # E-prop にならい 5ms 同一入力を継続
-    refractory_ms: float = 5.0    # 不応期の長さ [ms]
+    refractory_ms: float = 5.0    # 不応期の長さ [ms] (Predictive E-prop にならい 5ms)
 
     # ニューロン膜時定数・適応閾値時定数 [ms] (tau_mem_l1 < tau_mem_l2 で時間階層性を形成)
     tau_mem_l1: float = 10.0
@@ -157,7 +157,6 @@ class EligibilityTrace2D:
         self,
         alpha: float,
         rho: float,
-        v_th: float,
         beta: torch.Tensor,         # (1, n_post)
         psi_prev: torch.Tensor,     # (B, n_post)
         psi_curr: torch.Tensor,     # (B, n_post)
@@ -167,7 +166,7 @@ class EligibilityTrace2D:
         mask_t: Optional[torch.Tensor] = None,  # (B, 1)
     ) -> torch.Tensor:
         """
-        論文 式 (37)-(41), (50)-(51) に基づく適格性トレースと二重フィルタの更新。
+        論文 式 (1), (34)-(41), (50)-(51) に基づく適格性トレースと二重フィルタの更新。
         """
         # 1ステップ前の e_bar を退避 (オンライン学習シグナルの1ステップ遅延整合用)
         self.e_bar_prev.copy_(self.e_bar)
@@ -180,8 +179,8 @@ class EligibilityTrace2D:
         z_p = z_prev.unsqueeze(-1)
         pre_u = pre_input.unsqueeze(1)  # (B, 1, n_pre)
 
-        # ヤコビアン dh^t / dh^{t-1} の各成分 (式 34, 37)
-        j_vv = alpha - v_th * psi_p
+        # ヤコビアン dh^t / dh^{t-1} の各成分 (式 1 のリセット項 -z^{t-1} b^{t-1} に厳密整合)
+        j_vv = alpha - b_p * psi_p
         j_va = beta_u * (psi_p * b_p - z_p)
         j_av = psi_p
         j_aa = rho - beta_u * psi_p
@@ -284,7 +283,7 @@ class HPEPropLayer:
         """
         現在時刻 t の膜電位 v^t と適応閾値 b^t から、スパイク z^t・疑似微分 psi^t・
         平滑化スパイク z_bar^t を計算する。
-        要件: 不応期中はスパイクを 0、疑似微分を 0 とする。
+        不応期中はスパイクを 0、疑似微分を 0 とする。
         """
         # 履歴のシフト
         self.psi_prev.copy_(self.psi)
@@ -323,22 +322,19 @@ class HPEPropLayer:
     ) -> None:
         """
         時刻 t -> t+1 への膜電位 v と適応変数 a の更新 (式 1, 6)。
-        要件: 不応期中は膜電位をリセットしたときの電位に固定する。
+        Predictive E-prop に従い、発火ステップで式 (1) による減算リセット (-z^t * b^t) を行い、
+        その後の不応期中 (ref_count > 0) はリセット後の膜電位に固定する。
         """
         in_ref = self.ref_count > 0
         fired = self.z > 0.5
 
-        # 通常の膜電位更新 (式 1)
-        v_next = self.alpha * self.v + bottom_input + rec_input + self.i_bias
+        # 式 (1) に基づく膜電位更新 (発火ステップでは -z^t * b^t による減算リセットを適用)
+        v_next = self.alpha * self.v + bottom_input + rec_input + self.i_bias - self.z * self.b
         if e_self is not None:
             v_next = v_next - e_self
 
-        # 発火したニューロンは減算リセット電位 (v - b) に設定し、不応期へ移行
-        v_reset = self.v - self.b
-        v_after_reset = torch.where(fired, v_reset, v_next)
-
-        # すでに不応期中のニューロンはリセット時の電位 (現在の self.v) に固定
-        self.v = torch.where(in_ref, self.v, v_after_reset)
+        # すでに不応期中のニューロンはリセット後の電位 (現在の self.v) に固定
+        self.v = torch.where(in_ref, self.v, v_next)
 
         # 不応期カウンターの更新
         ref_dec = torch.clamp(self.ref_count - 1, min=0)
@@ -544,39 +540,39 @@ class HPEPropNetwork(nn.Module):
 
                 # --- 適格性トレースの更新 (時刻 t) ---
                 self.et_rec_1.update(
-                    self.l1.alpha, self.l1.rho, self.cfg.v_th, self.l1.beta,
+                    self.l1.alpha, self.l1.rho, self.l1.beta,
                     self.l1.psi_prev, self.l1.psi, self.l1.b_prev, self.l1.z_prev,
                     self.l1.z_bar_prev, mask_t=m_t,
                 )
                 self.et_rec_2.update(
-                    self.l2.alpha, self.l2.rho, self.cfg.v_th, self.l2.beta,
+                    self.l2.alpha, self.l2.rho, self.l2.beta,
                     self.l2.psi_prev, self.l2.psi, self.l2.b_prev, self.l2.z_prev,
                     self.l2.z_bar_prev, mask_t=m_t,
                 )
                 self.et_bot_0.update(
-                    self.l1.alpha, self.l1.rho, self.cfg.v_th, self.l1.beta,
+                    self.l1.alpha, self.l1.rho, self.l1.beta,
                     self.l1.psi_prev, self.l1.psi, self.l1.b_prev, self.l1.z_prev,
                     self.e0_prev, mask_t=m_t,
                 )
                 self.et_bot_1.update(
-                    self.l2.alpha, self.l2.rho, self.cfg.v_th, self.l2.beta,
+                    self.l2.alpha, self.l2.rho, self.l2.beta,
                     self.l2.psi_prev, self.l2.psi, self.l2.b_prev, self.l2.z_prev,
                     self.e1_prev, mask_t=m_t,
                 )
                 # W^{top,(1)} の自層経路 e_{top, ij}^{(1)} (式 94, 98)
                 self.et_top_1_self.update(
-                    self.l1.alpha, self.l1.rho, self.cfg.v_th, self.l1.beta,
+                    self.l1.alpha, self.l1.rho, self.l1.beta,
                     self.l1.psi_prev, self.l1.psi, self.l1.b_prev, self.l1.z_prev,
                     self.l2.z_bar_prev2, mask_t=m_t,
                 )
                 # W^{top,(0)}, W^{top,(1)} の上位層経路 (因数分解版, 式 103, 105)
                 self.et_top_0_upper.update(
-                    self.l1.alpha, self.l1.rho, self.cfg.v_th, self.l1.beta,
+                    self.l1.alpha, self.l1.rho, self.l1.beta,
                     self.l1.psi_prev, self.l1.psi, self.l1.b_prev, self.l1.z_prev,
                     self.l1.z_bar_prev2, mask_t=m_t,
                 )
                 self.et_top_1_upper.update(
-                    self.l2.alpha, self.l2.rho, self.cfg.v_th, self.l2.beta,
+                    self.l2.alpha, self.l2.rho, self.l2.beta,
                     self.l2.psi_prev, self.l2.psi, self.l2.b_prev, self.l2.z_prev,
                     self.l2.z_bar_prev2, mask_t=m_t,
                 )
@@ -714,8 +710,8 @@ class HPEPropNetwork(nn.Module):
 def build_timit_dataloaders(cfg: HPEPropConfig) -> Tuple[DataLoader, Optional[DataLoader]]:
     """encoder.py で前処理された TIMIT データセットから DataLoader を構築する"""
     device = torch.device(cfg.device)
-    train_dir = os.path.join(cfg.processed_timit_dir, "train")
-    dev_dir = os.path.join(cfg.processed_timit_dir, "develop")
+    train_dir = os.path.join(cfg.processed_timit_dir, "train_pickle")
+    dev_dir = os.path.join(cfg.processed_timit_dir, "develop_pickle")
 
     train_dataset = TimitProcessedDataset(train_dir, feature_type=cfg.feature_type)
     train_loader = DataLoader(
@@ -806,8 +802,8 @@ def train_timit(cfg: HPEPropConfig) -> HPEPropNetwork:
 
 if __name__ == "__main__":
     config = HPEPropConfig(
-        processed_timit_dir="/home/keitaro-sunagawa/Master-Research/Code/Predictive_E-prop/mainTask",
-        feature_type="mfcc",
+        processed_timit_dir="/home/keitaro-sunagawa/Master-Research/TIMIT/",
+        feature_type="fbank",
         n_l1=128,
         n_l2=128,
         frame_repeat_ms=5.0,
