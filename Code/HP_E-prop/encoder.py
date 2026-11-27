@@ -339,17 +339,17 @@ def timit_collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]], device: tor
 if __name__ == '__main__':
     # 手元の生データ配置パスと出力先パスを指定
     raw_timit_dir = '/home/keitaro-sunagawa/Master-Research/TIMIT'
-    processed_timit_dir = '/home/keitaro-sunagawa/Master-Research/Code/Predictive_E-prop/mainTask'
+    processed_timit_dir = '/home/keitaro-sunagawa/Master-Research/TIMIT'
 
     # 前処理の実行（未作成の場合）
-    if not os.path.exists(os.path.join(processed_timit_dir, 'train', 'mfccs.pickle')):
+    if not os.path.exists(os.path.join(processed_timit_dir, 'train_pickle', 'mfccs.pickle')):
         if os.path.exists(raw_timit_dir):
             preprocess_raw_timit(raw_timit_dir, processed_timit_dir)
         else:
             print(f"Raw TIMIT path '{raw_timit_dir}' not found. Please verify the directory path.")
 
     # PyTorch DataLoader 動作確認
-    train_pickle_path = os.path.join(processed_timit_dir, 'train')
+    train_pickle_path = os.path.join(processed_timit_dir, 'train_pickle')
     if os.path.exists(os.path.join(train_pickle_path, 'mfccs.pickle')):
         dev = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
         train_set = TimitProcessedDataset(train_pickle_path, feature_type='mfcc')
